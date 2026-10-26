@@ -1,0 +1,13 @@
+{
+  "_comment": "Пример PreToolUse-адаптера Claude Code (project .claude/settings.json). Установщик пишет это сам при --claude-hook; timeout — в секундах.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "node .githooks/pre-commit", "timeout": 420 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "Пример PreToolUse-адаптера ZCode (project .zcode/config.json). Установщик пишет это сам при --zcode-hook; git-хук .githooks/pre-commit — базовое принуждение, адаптер лишь даёт статус в интерфейсе.",
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${ZCODE_PROJECT_DIR}/.githooks/pre-commit"],
+              "timeoutMs": 420000,
+              "statusMessage": "Прогоняю гейт качества перед коммитом…"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

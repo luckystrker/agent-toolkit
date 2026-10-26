@@ -1,101 +1,364 @@
 #!/usr/bin/env node
-// Установщик agent-toolkit: скиллы → ~/.zcode/skills/, хук → в проект,
-// профиль → ~/.zcode/AGENTS.md. Node ≥ 18, без зависимостей.
+// Установщик agent-toolkit. Node ≥ 18, без зависимостей.
 //
-// Использование:
-//   node install.mjs                          # только скиллы
-//   node install.mjs --project <путь>         # + хук качества в проект
-//   node install.mjs --profile                # + профиль пользователя
+// Режимы:
+//   node install.mjs                          # user: скиллы + пайплайн-секция во все найденные harness'ы
+//   node install.mjs --project <путь>         # project: скиллы в репо + секция AGENTS.md + git-гейт
+// Дополнительно:
+//   --profile            # + профиль-секция в пользовательские файлы инструкций
+//   --skills-dir <путь>  # явная цель для скиллов (Pi, Qoder, Antigravity, ...)
+//   --zcode-hook         # (project) PreToolUse-адаптер ZCode (.zcode/config.json)
+//   --claude-hook        # (project) PreToolUse-адаптер Claude Code (.claude/settings.json)
+//   --instructions <файл># (project) доп. файл инструкций (CLAUDE.md, QODER.md, ...) — можно несколько
+//   --dry-run            # показать план, ничего не менять
+//   --remove             # убрать установленное (по манифесту); флаги те же
+//   --version
+//
+// Ничего не перезаписывает молча: изменённые файлы копируются в
+// ~/.agent-toolkit/backups/<дата>/ перед записью. Установленное регистрируется
+// в ~/.agent-toolkit/manifest.json — его и откатывает --remove.
 
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const VERSION = "2.0.0";
+const kitRoot = fileURLToPath(new URL(".", import.meta.url));
+const metaRoot = join(homedir(), ".agent-toolkit");
+const manifestPath = join(metaRoot, "manifest.json");
+
+// --- аргументы ---
 
 const args = process.argv.slice(2);
-const flagValue = (name) => {
-  const index = args.indexOf(name);
-  return index === -1 ? undefined : args[index + 1];
-};
+const flags = new Map(); // имя → массив значений (флаг без значения → [""])
+for (let i = 0; i < args.length; i++) {
+  if (!args[i].startsWith("--")) { console.error(`не понимаю аргумент: ${args[i]}`); process.exit(1); }
+  const name = args[i].slice(2);
+  const value = args[i + 1]?.startsWith("--") || args[i + 1] === undefined ? "" : args[++i];
+  flags.set(name, [...(flags.get(name) ?? []), value]);
+}
+const has = (name) => flags.has(name);
+const values = (name) => flags.get(name) ?? [];
+const value = (name) => values(name).find((v) => v !== "");
+const dryRun = has("dry-run");
+const remove = has("remove");
 
-const projectDir = flagValue("--project");
-const withProfile = args.includes("--profile");
-
-const kitRoot = import.meta.dirname;
-const zcodeSkills = join(homedir(), ".zcode", "skills");
-
-// --- 1. Скиллы ---
-mkdirSync(zcodeSkills, { recursive: true });
-for (const entry of ["grilling", "spec-to-checklist", "acceptance", "handoff", "tdd", "code-review", "research"]) {
-  const from = join(kitRoot, "skills", entry);
-  if (!existsSync(from)) {
-    console.error(`нет исходника: ${from}`);
-    process.exitCode = 1;
-    continue;
+if (has("version")) { console.log(VERSION); process.exit(0); }
+if (has("help")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(2, 18).join("\n")); process.exit(0); }
+for (const [name, minValues] of [["project", 1], ["skills-dir", 1], ["instructions", 1]]) {
+  if (has(name) && values(name).filter((v) => v !== "").length < minValues) {
+    console.error(`--${name} требует значение`);
+    process.exit(1);
   }
-  cpSync(from, join(zcodeSkills, entry), { recursive: true });
-  console.log(`скилл ${entry} → ~/.zcode/skills/${entry}`);
 }
 
-// --- 2. Хук качества в проект ---
-if (projectDir) {
-  const target = resolve(projectDir);
-  if (!existsSync(join(target, ".git"))) {
-    console.error(`--project: ${target} не выглядит git-репозиторием (нет .git) — хук не ставлю`);
+// --- источники тулкита ---
+
+const skillNames = readdirSync(join(kitRoot, "skills")).filter((n) => existsSync(join(kitRoot, "skills", n, "SKILL.md")));
+const pipelineTemplate = readFileSync(join(kitRoot, "agents", "pipeline-section.md"), "utf8").trim();
+// project-режим кладёт скиллы в .agents/skills (нативно сканирует OpenCode;
+// остальные harness'ы находят их по индексу в секции AGENTS.md)
+const sectionFor = (dir) => pipelineTemplate.replaceAll("{{SKILLS_DIR}}", dir);
+const pipelineSectionProject = sectionFor("`.agents/skills/` от корня репозитория");
+const pipelineSectionUser = sectionFor("родной каталог скиллов текущего harness'а (например `~/.claude/skills/`, `~/.zcode/skills/`)");
+const profileSection = [
+  "<!-- agent-toolkit:profile:start -->",
+  readFileSync(join(kitRoot, "profile", "AGENTS-user.md"), "utf8").trim(),
+  "<!-- agent-toolkit:profile:end -->",
+].join("\n");
+
+// harness'ы с известными путями; детекция — существует ли домашний каталог.
+// Pi, Qoder, Antigravity, Devin — через --skills-dir/--instructions или project-режим.
+const HARNESS_DEFS = [
+  { id: "claude", home: ".claude", skillsSub: "skills", instr: "CLAUDE.md" },
+  { id: "zcode", home: ".zcode", skillsSub: "skills", instr: "AGENTS.md" },
+  { id: "codex", home: ".codex", skillsSub: "skills", instr: "AGENTS.md" },
+  { id: "opencode", home: join(".config", "opencode"), skillsSub: "skills", instr: "AGENTS.md" },
+];
+const detected = HARNESS_DEFS.filter((h) => existsSync(join(homedir(), h.home)));
+
+// --- хранилище: действия, бэкапы, манифест ---
+
+const actions = [];
+function act(desc, fn) {
+  actions.push(desc);
+  if (!dryRun) fn();
+}
+function note(desc) { actions.push(desc); }
+
+let backupRoot = null;
+function backupExisting(absPath) {
+  if (!existsSync(absPath) || dryRun) return;
+  backupRoot ??= join(metaRoot, "backups", new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19));
+  const rel = absPath.replace(/^([a-zA-Z]:)?[\\/]/, "").replace(/[\\/]/g, "__");
+  const dest = join(backupRoot, rel);
+  mkdirSync(backupRoot, { recursive: true });
+  cpSync(absPath, dest, { recursive: true });
+  console.log(`  бэкап: ${absPath} → ${dest}`);
+}
+
+function readManifest() {
+  try { return JSON.parse(readFileSync(manifestPath, "utf8")); } catch { return { version: VERSION, userSkillsDirs: [], userInstructionFiles: [], projects: [] }; }
+}
+let manifest = readManifest();
+function saveManifest() {
+  if (dryRun) return;
+  mkdirSync(metaRoot, { recursive: true });
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+}
+
+// --- файловые операции ---
+
+function samePath(a, b) {
+  if (!existsSync(a) || !existsSync(b)) return false;
+  const sa = statSync(a), sb = statSync(b);
+  if (sa.isDirectory() !== sb.isDirectory()) return false;
+  if (!sa.isDirectory()) return readFileSync(a, "utf8") === readFileSync(b, "utf8");
+  return readdirSync(a).every((n) => samePath(join(a, n), join(b, n))) && readdirSync(a).length === readdirSync(b).length;
+}
+
+function installSkill(sourceDir, targetDir) {
+  if (samePath(sourceDir, targetDir)) { note(`  = ${targetDir} (уже актуален)`); return; }
+  backupExisting(targetDir);
+  act(`  + ${targetDir}${existsSync(targetDir) ? " (обновлён)" : ""}`, () => {
+    rmSync(targetDir, { recursive: true, force: true });
+    cpSync(sourceDir, targetDir, { recursive: true });
+  });
+}
+
+function upsertSection(text, section) {
+  const key = section.match(/<!-- agent-toolkit:([a-z]+):start -->/)[1];
+  const start = `<!-- agent-toolkit:${key}:start -->`;
+  const end = `<!-- agent-toolkit:${key}:end -->`;
+  const re = new RegExp(`${start.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${end}`);
+  const updated = re.test(text) ? text.replace(re, section) : `${text.trimEnd()}\n\n${section}\n`;
+  return updated === text ? null : updated;
+}
+
+function upsertSectionsInFile(file, sections) {
+  const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
+  let updated = existing;
+  for (const s of sections) updated = upsertSection(updated, s) ?? updated;
+  if (updated === existing) { note(`  = ${file} (секции уже актуальны)`); return; }
+  backupExisting(file);
+  act(`  + ${file} (секция${sections.length > 1 ? "и" : ""} agent-toolkit)`, () => { mkdirSync(join(file, ".."), { recursive: true }); writeFileSync(file, updated); });
+}
+
+function stripSectionsInFile(file) {
+  if (!existsSync(file)) return;
+  const text = readFileSync(file, "utf8");
+  const stripped = text.replace(/<!-- agent-toolkit:[a-z]+:start -->[\s\S]*?<!-- agent-toolkit:[a-z]+:end -->\n?/g, "").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+  if (stripped === text) { note(`  = ${file} (секций нет)`); return; }
+  backupExisting(file);
+  act(`  − ${file} (секции agent-toolkit удалены)`, () => writeFileSync(file, stripped));
+}
+
+// --- user-режим: скиллы + инструкции найденных harness'ов ---
+
+const skillsTargets = [
+  ...detected.map((h) => join(homedir(), h.home, h.skillsSub)),
+  ...values("skills-dir").map((p) => resolve(p)),
+];
+const instrTargets = detected.map((h) => join(homedir(), h.home, h.instr));
+
+function installUserMode() {
+  const sections = [pipelineSectionUser, ...(has("profile") ? [profileSection] : [])];
+  if (skillsTargets.length === 0 && instrTargets.length === 0) {
+    console.error("Не нашёл установленных harness'ов (claude/zcode/codex/opencode).\n" +
+      "Варианты: --project <путь> (универсально, работает везде), --skills-dir <путь>, либо создай каталог harness'а и повтори.");
+    process.exitCode = 1;
+    return;
+  }
+  for (const dir of skillsTargets) {
+    console.log(`Скиллы → ${dir}`);
+    for (const name of skillNames) installSkill(join(kitRoot, "skills", name), join(dir, name));
+    if (!dryRun) { manifest.userSkillsDirs = [...new Set([...manifest.userSkillsDirs, dir])]; }
+  }
+  if (instrTargets.length > 0 || skillsTargets.length > 0) {
+    for (const file of instrTargets) {
+      console.log(`Инструкции → ${file}`);
+      upsertSectionsInFile(file, sections);
+      if (!dryRun) { manifest.userInstructionFiles = [...new Set([...manifest.userInstructionFiles, file])]; }
+    }
+  }
+  if (has("profile") && instrTargets.length === 0) {
+    console.error("--profile: не найдено файлов пользовательских инструкций (см. список выше) — профиль не вставлен.");
+    process.exitCode = 1;
+  }
+}
+
+function removeUserMode() {
+  for (const dir of manifest.userSkillsDirs ?? []) {
+    console.log(`Скиллы − ${dir}`);
+    for (const name of skillNames) {
+      const target = join(dir, name);
+      if (!existsSync(target)) continue;
+      backupExisting(target);
+      act(`  − ${target}`, () => rmSync(target, { recursive: true, force: true }));
+    }
+  }
+  for (const file of manifest.userInstructionFiles ?? []) stripSectionsInFile(file);
+  manifest.userSkillsDirs = [];
+  manifest.userInstructionFiles = [];
+}
+
+// --- project-режим ---
+
+const projectDir = has("project") ? resolve(value("project")) : null;
+const projectInstructions = ["AGENTS.md", ...values("instructions").map((p) => {
+  const abs = resolve(process.cwd(), p);
+  return abs.startsWith(projectDir ?? abs) ? abs.slice((projectDir ?? abs).length + 1) : abs.replace(/[\\/]/g, "__");
+})];
+
+const GATE_HOOK = { src: join(kitRoot, "gate", "pre-commit"), dest: ".githooks", configKey: "core.hooksPath" };
+
+function gitIn(dir, cmdArgs) {
+  return spawnSync("git", ["-C", dir, ...cmdArgs], { encoding: "utf8" });
+}
+
+function zcodeHookEntry() {
+  return {
+    matcher: "Bash",
+    hooks: [{
+      type: "process", command: "node",
+      args: ["${ZCODE_PROJECT_DIR}/.githooks/pre-commit"],
+      timeoutMs: 420000, statusMessage: "Прогоняю гейт качества перед коммитом…",
+    }],
+  };
+}
+const claudeHookEntry = () => ({
+  matcher: "Bash",
+  hooks: [{ type: "command", command: "node .githooks/pre-commit", timeout: 420 }],
+});
+
+function upsertAdapterConfig(file, wire) {
+  // wire(configJson) возвращает изменённый объект или null, если уже стоит
+  let config = {};
+  if (existsSync(file)) {
+    try { config = JSON.parse(readFileSync(file, "utf8")); }
+    catch { console.error(`  ${file} не парсится как JSON — не трогаю`); process.exitCode = 1; return; }
+  }
+  const updated = wire(config);
+  if (!updated) { note(`  = ${file} (адаптер уже подключён)`); return; }
+  backupExisting(file);
+  act(`  + ${file} (адаптер гейта)`, () => { mkdirSync(join(file, ".."), { recursive: true }); writeFileSync(file, JSON.stringify(updated, null, 2) + "\n"); });
+}
+
+function installProjectMode() {
+  if (!existsSync(projectDir)) { console.error(`--project: ${projectDir} не существует`); process.exitCode = 1; return; }
+  const isGit = existsSync(join(projectDir, ".git"));
+
+  // 1. скиллы в репозиторий: .agents/skills — нативно для OpenCode,
+  //    для остальных — через индекс в секции AGENTS.md (шаг 2)
+  for (const name of skillNames) {
+    const from = join(kitRoot, "skills", name);
+    const to = join(projectDir, ".agents", "skills", name);
+    console.log(`Скилл ${name} → ${to}`);
+    installSkill(from, to);
+  }
+
+  // 2. секция-диспетчер в файлы инструкций
+  const sections = [pipelineSectionProject];
+  for (const rel of projectInstructions) {
+    const file = join(projectDir, rel);
+    console.log(`Инструкции → ${file}`);
+    upsertSectionsInFile(file, sections);
+  }
+
+  // 3. git-гейт: универсальное принуждение (терминал, IDE, любой агент, обёртки)
+  if (!isGit) {
+    console.error("Не git-репозиторий (.git не найден) — хук гейта не ставлю, остальное установлено.");
     process.exitCode = 1;
   } else {
-    mkdirSync(join(target, ".zcode", "hooks"), { recursive: true });
-    cpSync(join(kitRoot, "hooks", "pre-commit-gate.mjs"), join(target, ".zcode", "hooks", "pre-commit-gate.mjs"));
+    const hookDest = join(projectDir, GATE_HOOK.dest, "pre-commit");
+    console.log(`Гейт → ${hookDest} (+ git config ${GATE_HOOK.configKey} ${GATE_HOOK.dest})`);
+    if (!samePath(GATE_HOOK.src, hookDest)) {
+      backupExisting(hookDest);
+      act(`  + ${hookDest}`, () => {
+        mkdirSync(join(projectDir, GATE_HOOK.dest), { recursive: true });
+        cpSync(GATE_HOOK.src, hookDest);
+      });
+    } else note("  = хук уже актуален");
+    act(`  + git config ${GATE_HOOK.configKey} ${GATE_HOOK.dest}`, () => {
+      const res = gitIn(projectDir, ["config", GATE_HOOK.configKey, GATE_HOOK.dest]);
+      if (res.status !== 0) { console.error(`git config не удался:\n${res.stderr}`); process.exitCode = 1; }
+    });
+  }
 
-    const configPath = join(target, ".zcode", "config.json");
-    let config = {};
-    if (existsSync(configPath)) {
-      try {
-        config = JSON.parse(readFileSync(configPath, "utf8"));
-      } catch {
-        console.error(`${configPath} не парсится как JSON — конфиг не трогаю, хук уже скопирован`);
-        process.exitCode = 1;
+  // 4. опциональные PreToolUse-адаптеры (дублируют гейт ради UX статуса в harness)
+  const adapters = [];
+  if (has("zcode-hook")) {
+    console.log("Адаптер ZCode → .zcode/config.json");
+    upsertAdapterConfig(join(projectDir, ".zcode", "config.json"), (c) => {
+      c.hooks ??= {}; c.hooks.enabled = true; c.hooks.events ??= {};
+      const arr = (c.hooks.events.PreToolUse ??= []);
+      if (JSON.stringify(arr).includes(".githooks/pre-commit")) return null;
+      arr.push(zcodeHookEntry());
+      return c;
+    });
+    adapters.push("zcode");
+  }
+  if (has("claude-hook")) {
+    console.log("Адаптер Claude Code → .claude/settings.json");
+    upsertAdapterConfig(join(projectDir, ".claude", "settings.json"), (c) => {
+      c.hooks ??= {}; c.hooks.events ??= {};
+      const arr = (c.hooks.PreToolUse ??= []);
+      if (JSON.stringify(arr).includes(".githooks/pre-commit")) return null;
+      arr.push(claudeHookEntry());
+      return c;
+    });
+    adapters.push("claude");
+  }
+
+  if (!dryRun) {
+    manifest.projects = [
+      ...manifest.projects.filter((p) => p.dir !== projectDir),
+      { dir: projectDir, instructions: projectInstructions, adapters },
+    ];
+  }
+}
+
+function removeProjectMode() {
+  const entry = manifest.projects.find((p) => resolve(p.dir) === projectDir);
+  if (!entry) { console.error(`--remove --project: ${projectDir} отсутствует в манифесте`); process.exitCode = 1; return; }
+  for (const name of skillNames) {
+    const target = join(projectDir, ".agents", "skills", name);
+    if (!existsSync(target)) continue;
+    backupExisting(target);
+    act(`  − ${target}`, () => rmSync(target, { recursive: true, force: true }));
+  }
+  for (const rel of entry.instructions) stripSectionsInFile(join(projectDir, rel));
+  const hookDest = join(projectDir, GATE_HOOK.dest, "pre-commit");
+  if (existsSync(hookDest)) {
+    backupExisting(hookDest);
+    act(`  − ${hookDest}`, () => rmSync(hookDest, { force: true }));
+    act(`  − git config --unset ${GATE_HOOK.configKey}`, () => gitIn(projectDir, ["config", "--unset", GATE_HOOK.configKey]));
+  }
+  for (const adapter of entry.adapters ?? []) {
+    const file = adapter === "zcode" ? join(projectDir, ".zcode", "config.json") : join(projectDir, ".claude", "settings.json");
+    if (!existsSync(file)) continue;
+    try {
+      const config = JSON.parse(readFileSync(file, "utf8"));
+      const events = config.hooks?.events ?? config.hooks;
+      for (const key of ["PreToolUse"]) {
+        const arr = events?.[key];
+        if (Array.isArray(arr)) events[key] = arr.filter((g) => !JSON.stringify(g).includes(".githooks/pre-commit"));
       }
-    }
-    if (!config.hooks?.events?.PreToolUse) {
-      config.hooks = {
-        ...(config.hooks ?? {}),
-        enabled: true,
-        events: {
-          ...(config.hooks?.events ?? {}),
-          PreToolUse: [
-            {
-              matcher: "Bash",
-              hooks: [
-                {
-                  type: "process",
-                  command: "node",
-                  args: ["${ZCODE_PROJECT_DIR}/.zcode/hooks/pre-commit-gate.mjs"],
-                  timeoutMs: 180000,
-                  statusMessage: "Прогоняю гейт качества перед коммитом…",
-                },
-              ],
-            },
-          ],
-        },
-      };
-      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
-      console.log(`хук → ${target}/.zcode/ (config.json дополнен)`);
-    } else {
-      console.log(`хук → ${target}/.zcode/hooks/ (PreToolUse уже задан — config.json не трогал)`);
-    }
+      backupExisting(file);
+      act(`  − ${file} (адаптер удалён)`, () => writeFileSync(file, JSON.stringify(config, null, 2) + "\n"));
+    } catch { console.error(`  ${file} не парсится — пропускаю`); }
   }
+  manifest.projects = manifest.projects.filter((p) => p.dir !== projectDir);
 }
 
-// --- 3. Профиль пользователя ---
-if (withProfile) {
-  const dest = join(homedir(), ".zcode", "AGENTS.md");
-  if (existsSync(dest)) {
-    const backup = `${dest}.bak`;
-    cpSync(dest, backup);
-    console.log(`существующий профиль сохранён: ${backup}`);
-  }
-  cpSync(join(kitRoot, "profile", "AGENTS-user.md"), dest);
-  console.log(`профиль → ${dest}`);
-}
+// --- запуск ---
 
-console.log("готово");
+console.log(dryRun ? `agent-toolkit v${VERSION} — dry-run (ничего не меняется)\n` : `agent-toolkit v${VERSION}\n`);
+if (projectDir) { remove ? removeProjectMode() : installProjectMode(); }
+else { remove ? removeUserMode() : installUserMode(); }
+saveManifest();
+console.log(`\n${dryRun ? `План (${actions.length} действий) — запусти без --dry-run для применения.` : `Готово: ${actions.length} действий.`}` +
+  (backupRoot ? `\nБэкапы изменённого: ${backupRoot}` : ""));
+if (actions.length === 0 && !process.exitCode) console.log("Изменений не требуется — всё уже актуально.");

@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+/**
+ * agent-toolkit quality gate — один файл, два режима:
+ *
+ *  1. git pre-commit (универсально): git вызывает этот файл сам —
+ *     проверка выполняется всегда, как бы ни был запущен коммит.
+ *  2. PreToolUse-адаптер (ZCode / Claude Code): читает JSON-payload из stdin
+ *     и гейтит только команды `git commit`.
+ *
+ * Гейты: `npm run --if-present lint|typecheck|test` (fail-fast, таймаут на каждый).
+ * Перед прогоном сверяет рабочее дерево с индексом: гейт обязан проверять
+ * именно то, что уйдёт в коммит.
+ *
+ * Коды выхода: 0 = пропустить, 2 = блокировать, другое ненулевое = ошибка хука.
+ * Проект без package.json или без гейт-скриптов пропускается С ПРЕДУПРЕЖДЕНИЕМ
+ * (fail-open объявлен явно, а не молча).
+ */
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const GATE_TIMEOUT_MS = Number(process.env.AGENT_TOOLKIT_GATE_TIMEOUT_MS) || 120_000; // на один гейт; 3 × 120с < внешнего таймаута адаптеров
+const repoDir = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// --- stdin / режим ---
+
+function readStdin() {
+  if (process.stdin.isTTY) return ""; // ручной запуск без payload — прямой режим
+  try {
+    return readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function isGitCommit(raw) {
+  if (!raw) return false;
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return false; // нечитаемый payload: никогда не блокируем
+  }
+  const command = payload?.tool_input?.command ?? payload?.input?.command ?? "";
+  if (typeof command !== "string") return false; // не Bash-команда — не наше событие
+  // `git ... commit`, включая `git -C path commit`; но не `commit --help` и не справка
+  return /\bgit\b[^\n|;&]*\bcommit\b/.test(command) && !/--help/.test(command);
+}
+
+// --- сверка дерева с индексом ---
+
+function treeMatchesIndex() {
+  const res = spawnSync("git", ["status", "--porcelain"], { cwd: repoDir, encoding: "utf8" });
+  if (res.status !== 0) {
+    console.error("[gate] не удалось выполнить `git status` — сверку дерева с индексом пропускаю");
+    return true; // не блокируем из-за невозможности проверить
+  }
+  const diverged = [];
+  for (const line of res.stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const x = line[0];
+    const y = line[1] ?? " ";
+    // '??' — неотслеживаемое; Y ≠ ' ' при X ≠ '?' — правки не в индексе:
+    // в обоих случаях тесты гоняются по состоянию, отличному от коммита
+    if (x === "?" || (y !== " " && x !== "?")) diverged.push(line.slice(3));
+  }
+  if (diverged.length === 0) return true;
+  console.error(
+    `[gate] Рабочее дерево расходится с тем, что уйдёт в коммит:\n` +
+      diverged.map((f) => `  ${f}`).join("\n") +
+      `\nГейт проверяет рабочее дерево, а коммит фиксирует индекс — закоммитилось бы непроверенное.\n` +
+      `Сделай \`git add -A\` (или stash лишнее), затем повтори коммит.`
+  );
+  return false;
+}
+
+// --- гейты ---
+
+function run(script) {
+  // Windows: npm — это npm.cmd, прямой spawn без оболочки запрещён (EINVAL);
+  // shell-строка безопасна: script всегда из фиксированного набора lint/typecheck/test
+  const res =
+    process.platform === "win32"
+      ? spawnSync(`npm run --if-present ${script}`, { cwd: repoDir, encoding: "utf8", timeout: GATE_TIMEOUT_MS, shell: true })
+      : spawnSync("npm", ["run", "--if-present", script], { cwd: repoDir, encoding: "utf8", timeout: GATE_TIMEOUT_MS });
+  const timedOut = res.error?.code === "ETIMEDOUT" || res.signal === "SIGTERM";
+  const spawnError = !timedOut && res.error ? `${res.error.code ?? ""}: ${res.error.message}` : null;
+  return { script, ok: !timedOut && !spawnError && res.status === 0, timedOut, spawnError, output: (res.stdout || "") + (res.stderr || "") };
+}
+
+function main() {
+  const raw = readStdin();
+  if (raw.trim().length > 0 && !isGitCommit(raw)) {
+    // payload-режим (ZCode/Claude Code): не `git commit` — пропускаем.
+    // Пустой stdin — прямой режим git-хука: гейтим всегда.
+    process.exit(0);
+  }
+
+  if (!treeMatchesIndex()) process.exit(2);
+
+  const pkgPath = join(repoDir, "package.json");
+  if (!existsSync(pkgPath)) {
+    console.error("[gate] package.json не найден — гейтов нет, коммит проходит НЕПРОВЕРЕННЫМ.");
+    process.exit(0);
+  }
+  let scripts = {};
+  try {
+    scripts = JSON.parse(readFileSync(pkgPath, "utf8")).scripts ?? {};
+  } catch {
+    console.error("[gate] package.json не парсится как JSON — гейтить вслепую отказываюсь.");
+    process.exit(2);
+  }
+  const gates = ["lint", "typecheck", "test"].filter((s) => scripts[s]);
+  if (gates.length === 0) {
+    console.error("[gate] В package.json нет lint/typecheck/test — коммит проходит НЕПРОВЕРЕННЫМ.");
+    process.exit(0);
+  }
+
+  for (const g of gates) {
+    // fail-fast: первый упавший гейт останавливает — гонять остальные на красном дереве бессмысленно
+    const r = run(g);
+    if (!r.ok) {
+      if (r.timedOut) {
+        console.error(`[gate] \`npm run ${r.script}\` не уложился в ${GATE_TIMEOUT_MS / 1000} с (watch-режим?). Коммит заблокирован.`);
+      } else if (r.spawnError) {
+        console.error(`[gate] не удалось запустить \`npm run ${r.script}\`: ${r.spawnError}`);
+      } else {
+        console.error(`\n[gate] \`npm run ${r.script}\` упал:\n${r.output.slice(-4000)}`);
+      }
+      console.error(`[gate] Коммит заблокирован: гейт \`${r.script}\`.`);
+      process.exit(2);
+    }
+  }
+  process.exit(0);
+}
+
+main();
