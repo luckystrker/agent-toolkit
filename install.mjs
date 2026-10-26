@@ -9,7 +9,7 @@
 //   --skills-dir <путь>  # явная цель для скиллов (Pi, Qoder, Antigravity, ...)
 //   --zcode-hook         # (project) PreToolUse-адаптер ZCode (.zcode/config.json)
 //   --claude-hook        # (project) PreToolUse-адаптер Claude Code (.claude/settings.json)
-//   --instructions <файл># (project) доп. файл инструкций (CLAUDE.md, QODER.md, ...) — можно несколько
+//   --instructions <файл># доп. файл инструкций (CLAUDE.md, QODER.md, ...) — можно несколько
 //   --dry-run            # показать план, ничего не менять
 //   --remove             # убрать установленное (по манифесту); флаги те же
 //   --version
@@ -18,13 +18,13 @@
 // ~/.agent-toolkit/backups/<дата>/ перед записью. Установленное регистрируется
 // в ~/.agent-toolkit/manifest.json — его и откатывает --remove.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "2.0.0";
+const VERSION = "2.0.1";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
@@ -149,7 +149,8 @@ function upsertSectionsInFile(file, sections) {
 function stripSectionsInFile(file) {
   if (!existsSync(file)) return;
   const text = readFileSync(file, "utf8");
-  const stripped = text.replace(/<!-- agent-toolkit:[a-z]+:start -->[\s\S]*?<!-- agent-toolkit:[a-z]+:end -->\n?/g, "").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+  // нормализуем только концы файла; пустые строки в чужом контенте не трогаем
+  const stripped = text.replace(/<!-- agent-toolkit:[a-z]+:start -->[\s\S]*?<!-- agent-toolkit:[a-z]+:end -->\n?/g, "").trimEnd() + "\n";
   if (stripped === text) { note(`  = ${file} (секций нет)`); return; }
   backupExisting(file);
   act(`  − ${file} (секции agent-toolkit удалены)`, () => writeFileSync(file, stripped));
@@ -161,7 +162,10 @@ const skillsTargets = [
   ...detected.map((h) => join(homedir(), h.home, h.skillsSub)),
   ...values("skills-dir").map((p) => resolve(p)),
 ];
-const instrTargets = detected.map((h) => join(homedir(), h.home, h.instr));
+const instrTargets = [
+  ...detected.map((h) => join(homedir(), h.home, h.instr)),
+  ...values("instructions").map((p) => resolve(p)),
+];
 
 function installUserMode() {
   const sections = [pipelineSectionUser, ...(has("profile") ? [profileSection] : [])];
@@ -187,6 +191,13 @@ function installUserMode() {
     console.error("--profile: не найдено файлов пользовательских инструкций (см. список выше) — профиль не вставлен.");
     process.exitCode = 1;
   }
+  if (instrTargets.length === 0 && skillsTargets.length > 0) {
+    console.error(
+      "Внимание: секция-диспетчер пайплайна не доставлена ни в один файл инструкций —\n" +
+      "скиллы установлены, но правила конвейера в контекст агента не попали.\n" +
+      "Добавь --instructions <файл> (например, AGENTS.md проекта) или используй --project."
+    );
+  }
 }
 
 function removeUserMode() {
@@ -207,12 +218,19 @@ function removeUserMode() {
 // --- project-режим ---
 
 const projectDir = has("project") ? resolve(value("project")) : null;
+// записи в манифесте: относительный путь внутри проекта либо абсолютный (вне проекта —
+// сравнение через path.relative, не строковым префиксом: "alp" ≠ родитель "alp-extra")
 const projectInstructions = ["AGENTS.md", ...values("instructions").map((p) => {
-  const abs = resolve(process.cwd(), p);
-  return abs.startsWith(projectDir ?? abs) ? abs.slice((projectDir ?? abs).length + 1) : abs.replace(/[\\/]/g, "__");
+  const abs = resolve(p);
+  const rel = relative(projectDir, abs);
+  return rel.startsWith("..") || isAbsolute(rel) ? abs : rel;
 })];
+const instrFile = (entry) => (isAbsolute(entry) ? entry : join(projectDir, entry));
 
-const GATE_HOOK = { src: join(kitRoot, "gate", "pre-commit"), dest: ".githooks", configKey: "core.hooksPath" };
+const HOOKS = {
+  "pre-commit": null, // гейт качества; источник подставляется ниже
+  "commit-msg": null, // ссылка на чек-лист в сообщении коммита
+};
 
 function gitIn(dir, cmdArgs) {
   return spawnSync("git", ["-C", dir, ...cmdArgs], { encoding: "utf8" });
@@ -249,6 +267,7 @@ function upsertAdapterConfig(file, wire) {
 function installProjectMode() {
   if (!existsSync(projectDir)) { console.error(`--project: ${projectDir} не существует`); process.exitCode = 1; return; }
   const isGit = existsSync(join(projectDir, ".git"));
+  let previousHooksPath = null;
 
   // 1. скиллы в репозиторий: .agents/skills — нативно для OpenCode,
   //    для остальных — через индекс в секции AGENTS.md (шаг 2)
@@ -262,27 +281,38 @@ function installProjectMode() {
   // 2. секция-диспетчер в файлы инструкций
   const sections = [pipelineSectionProject];
   for (const rel of projectInstructions) {
-    const file = join(projectDir, rel);
-    console.log(`Инструкции → ${file}`);
-    upsertSectionsInFile(file, sections);
+    console.log(`Инструкции → ${instrFile(rel)}`);
+    upsertSectionsInFile(instrFile(rel), sections);
   }
 
-  // 3. git-гейт: универсальное принуждение (терминал, IDE, любой агент, обёртки)
+  // 3. git-хуки: pre-commit (гейт) + commit-msg (ссылка на чек-лист) —
+  //    универсальное принуждение (терминал, IDE, любой агент, обёртки)
   if (!isGit) {
-    console.error("Не git-репозиторий (.git не найден) — хук гейта не ставлю, остальное установлено.");
+    console.error("Не git-репозиторий (.git не найден) — хуки не ставлю, остальное установлено.");
     process.exitCode = 1;
   } else {
-    const hookDest = join(projectDir, GATE_HOOK.dest, "pre-commit");
-    console.log(`Гейт → ${hookDest} (+ git config ${GATE_HOOK.configKey} ${GATE_HOOK.dest})`);
-    if (!samePath(GATE_HOOK.src, hookDest)) {
-      backupExisting(hookDest);
-      act(`  + ${hookDest}`, () => {
-        mkdirSync(join(projectDir, GATE_HOOK.dest), { recursive: true });
-        cpSync(GATE_HOOK.src, hookDest);
+    const hooksDir = join(projectDir, ".githooks");
+    console.log(`Хуки → ${hooksDir}/ (pre-commit, commit-msg) + git config core.hooksPath .githooks`);
+    for (const name of Object.keys(HOOKS)) {
+      const src = join(kitRoot, "gate", name);
+      const dest = join(hooksDir, name);
+      if (samePath(src, dest)) { note(`  = ${dest} (уже актуален)`); continue; }
+      backupExisting(dest);
+      act(`  + ${dest}`, () => {
+        mkdirSync(hooksDir, { recursive: true });
+        cpSync(src, dest);
+        chmodSync(dest, 0o755); // POSIX: без бита исполнения git молча пропускает хук
       });
-    } else note("  = хук уже актуален");
-    act(`  + git config ${GATE_HOOK.configKey} ${GATE_HOOK.dest}`, () => {
-      const res = gitIn(projectDir, ["config", GATE_HOOK.configKey, GATE_HOOK.dest]);
+    }
+    previousHooksPath = gitIn(projectDir, ["config", "--get", "core.hooksPath"]).stdout.trim() || null;
+    if (previousHooksPath && previousHooksPath !== ".githooks") {
+      console.error(
+        `  внимание: проект уже использует core.hooksPath=${previousHooksPath} (чужие хуки: husky/lefthook?).\n` +
+        `  Установщик переключит его на .githooks; прежнее значение сохранено в манифесте и вернётся при --remove.`
+      );
+    }
+    act(`  + git config core.hooksPath .githooks`, () => {
+      const res = gitIn(projectDir, ["config", "core.hooksPath", ".githooks"]);
       if (res.status !== 0) { console.error(`git config не удался:\n${res.stderr}`); process.exitCode = 1; }
     });
   }
@@ -303,7 +333,7 @@ function installProjectMode() {
   if (has("claude-hook")) {
     console.log("Адаптер Claude Code → .claude/settings.json");
     upsertAdapterConfig(join(projectDir, ".claude", "settings.json"), (c) => {
-      c.hooks ??= {}; c.hooks.events ??= {};
+      c.hooks ??= {}; // схема Claude: hooks.PreToolUse напрямую, без events
       const arr = (c.hooks.PreToolUse ??= []);
       if (JSON.stringify(arr).includes(".githooks/pre-commit")) return null;
       arr.push(claudeHookEntry());
@@ -315,7 +345,7 @@ function installProjectMode() {
   if (!dryRun) {
     manifest.projects = [
       ...manifest.projects.filter((p) => p.dir !== projectDir),
-      { dir: projectDir, instructions: projectInstructions, adapters },
+      { dir: projectDir, instructions: projectInstructions, adapters, previousHooksPath },
     ];
   }
 }
@@ -329,23 +359,45 @@ function removeProjectMode() {
     backupExisting(target);
     act(`  − ${target}`, () => rmSync(target, { recursive: true, force: true }));
   }
-  for (const rel of entry.instructions) stripSectionsInFile(join(projectDir, rel));
-  const hookDest = join(projectDir, GATE_HOOK.dest, "pre-commit");
-  if (existsSync(hookDest)) {
-    backupExisting(hookDest);
-    act(`  − ${hookDest}`, () => rmSync(hookDest, { force: true }));
-    act(`  − git config --unset ${GATE_HOOK.configKey}`, () => gitIn(projectDir, ["config", "--unset", GATE_HOOK.configKey]));
+  for (const rel of entry.instructions) stripSectionsInFile(instrFile(rel));
+
+  const hooksDir = join(projectDir, ".githooks");
+  for (const name of Object.keys(HOOKS)) {
+    const dest = join(hooksDir, name);
+    if (!existsSync(dest)) continue;
+    backupExisting(dest);
+    act(`  − ${dest}`, () => rmSync(dest, { force: true }));
   }
+  // hooksPath: восстановить прежнее значение из манифеста; если своих хуков не
+  // было — снять; в .githooks остались чужие хуки — оставить как есть
+  const restore = entry.previousHooksPath && entry.previousHooksPath !== ".githooks" ? entry.previousHooksPath : null;
+  const remaining = existsSync(hooksDir) ? readdirSync(hooksDir).length : 0;
+  if (restore) {
+    act(`  − git config core.hooksPath → ${restore} (восстановлено)`, () => gitIn(projectDir, ["config", "core.hooksPath", restore]));
+  } else if (remaining === 0) {
+    act(`  − git config --unset core.hooksPath`, () => gitIn(projectDir, ["config", "--unset", "core.hooksPath"]));
+  } else {
+    note(`  = core.hooksPath оставлен: в .githooks остались другие хуки (${remaining})`);
+  }
+
   for (const adapter of entry.adapters ?? []) {
     const file = adapter === "zcode" ? join(projectDir, ".zcode", "config.json") : join(projectDir, ".claude", "settings.json");
     if (!existsSync(file)) continue;
     try {
       const config = JSON.parse(readFileSync(file, "utf8"));
-      const events = config.hooks?.events ?? config.hooks;
-      for (const key of ["PreToolUse"]) {
-        const arr = events?.[key];
-        if (Array.isArray(arr)) events[key] = arr.filter((g) => !JSON.stringify(g).includes(".githooks/pre-commit"));
+      const hooks = (config.hooks ??= {});
+      const container = adapter === "zcode" ? ((hooks.events ??= {})) : hooks;
+      let changed = false;
+      if (Array.isArray(container.PreToolUse)) {
+        const filtered = container.PreToolUse.filter((g) => !JSON.stringify(g).includes(".githooks/pre-commit"));
+        changed = filtered.length !== container.PreToolUse.length;
+        if (filtered.length === 0) delete container.PreToolUse;
+        else container.PreToolUse = filtered;
       }
+      // вычистить опустевшие структуры, созданные установщиком
+      if (adapter === "zcode" && hooks.events && Object.keys(hooks.events).length === 0) delete hooks.events;
+      if (config.hooks && Object.keys(config.hooks).length === 0) delete config.hooks;
+      if (!changed) { note(`  = ${file} (нашей записи нет)`); continue; }
       backupExisting(file);
       act(`  − ${file} (адаптер удалён)`, () => writeFileSync(file, JSON.stringify(config, null, 2) + "\n"));
     } catch { console.error(`  ${file} не парсится — пропускаю`); }

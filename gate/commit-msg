@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+/**
+ * agent-toolkit commit-msg hook — принуждение правила конвейера №5:
+ * сообщение коммита ссылается на пункт чек-листа (`CHECKLIST N.N — <что сделано>`).
+ *
+ * Активен только когда в корне репозитория есть CHECKLIST.md — без чек-листа
+ * ссылаться не на что, хук молча пропускает.
+ *
+ * Проходит без ссылки: merge/revert/fixup/squash коммиты и сообщения с явным
+ * обходом `[no-checklist]` (осознанное решение человека, оно остаётся в истории).
+ *
+ * Коды выхода: 0 = пропустить, 2 = блокировать.
+ * Про файл без расширения и динамический import() — см. комментарий в gate/pre-commit.
+ */
+main().catch((e) => {
+  console.error(`[commit-msg] внутренняя ошибка: ${e?.stack ?? e}`);
+  process.exit(1);
+});
+
+async function main() {
+  const { existsSync, readFileSync } = await import("node:fs");
+  const { dirname, join, resolve } = await import("node:path");
+
+  const repoDir = dirname(dirname(resolve(process.argv[1])));
+  const msgPath = process.argv[2]; // git передаёт путь к файлу с сообщением коммита
+  if (!msgPath) process.exit(0);
+  if (!existsSync(join(repoDir, "CHECKLIST.md"))) process.exit(0);
+
+  let msg = "";
+  try {
+    msg = readFileSync(msgPath, "utf8");
+  } catch {
+    process.exit(0); // нечитаемое сообщение — не блокируем
+  }
+
+  const firstLine = msg.split("\n")[0].trim();
+  const generated = /^(merge\b|revert\b|fixup!|squash!)/i.test(firstLine);
+  if (generated) process.exit(0);
+  if (/checklist\s*\d+(\.\d+)?/i.test(msg) || /\[no-checklist\]/i.test(msg)) process.exit(0);
+
+  console.error(
+    `[commit-msg] В репозитории есть CHECKLIST.md — сошлись на пункт в сообщении:\n` +
+      `  CHECKLIST N.N — <что сделано>\n` +
+      `Это правило конвейера (agent-toolkit). Осознанный обход — добавь [no-checklist] в сообщение.`
+  );
+  process.exit(2);
+}
