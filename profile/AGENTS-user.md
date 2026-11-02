@@ -13,3 +13,10 @@
 - Before implementation: explicit stages, dependencies, checks, and readiness criteria. Separate "technically done" (tests/gates green) from "ready for manual acceptance by the user" (a real run the user can observe).
 - Real evidence over claims: an actual run/log/screenshot beats "should work". Report failures honestly with output.
 - Values reusable workflows and durable documentation over one-off heroics; likes explicit decision records (what was decided, when, why) over silent drift.
+
+### What the owner does (everything else is the factory's job)
+
+- **Taste.** May say "no" to something that works. Treat it as signal, not friction: record it verbatim (`correct` skill) and ask one short "why" if the reason is not obvious.
+- **Deletion.** Values removing crutches written for a previous model, rules that never fire, and code nobody needs. Proactively propose deletions; do not only add.
+- **Ambition.** Asks for ×100, not +2 %. Alongside the safe incremental option, always show the bold version and what it would take.
+- Agents wait for the owner, not the other way round: work autonomously within the pipeline rules, check the `judge` skill before asking, and bring decisions in one batch with options rather than one interruption at a time. Money, people, irreversible actions and access always go to the owner.

@@ -3,7 +3,7 @@
 //
 // Режимы:
 //   node install.mjs                          # user: скиллы + пайплайн-секция во все найденные harness'ы
-//   node install.mjs --project <путь>         # project: скиллы в репо + секция AGENTS.md + git-гейт
+//   node install.mjs --project <путь>         # project: скиллы в репо + секция AGENTS.md + git-гейт + .agents/bin (доска, бенч)
 // Дополнительно:
 //   --profile            # + профиль-секция в пользовательские файлы инструкций
 //   --skills-dir <путь>  # явная цель для скиллов (Pi, Qoder, Antigravity, ...)
@@ -24,7 +24,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "2.0.1";
+const VERSION = "3.0.0";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
@@ -56,6 +56,7 @@ for (const [name, minValues] of [["project", 1], ["skills-dir", 1], ["instructio
 
 // --- источники тулкита ---
 
+const toolNames = readdirSync(join(kitRoot, "tools")).filter((n) => n.endsWith(".mjs"));
 const skillNames = readdirSync(join(kitRoot, "skills")).filter((n) => existsSync(join(kitRoot, "skills", n, "SKILL.md")));
 const pipelineTemplate = readFileSync(join(kitRoot, "agents", "pipeline-section.md"), "utf8").trim();
 // project-режим кладёт скиллы в .agents/skills (нативно сканирует OpenCode;
@@ -278,6 +279,17 @@ function installProjectMode() {
     installSkill(from, to);
   }
 
+  // 1b. исполняемый слой фабрики: общая доска + лог событий, сравнение бенчмарков
+  const binDir = join(projectDir, ".agents", "bin");
+  console.log(`Инструменты → ${binDir}/ (${toolNames.join(", ")})`);
+  for (const name of toolNames) {
+    const src = join(kitRoot, "tools", name);
+    const dest = join(binDir, name);
+    if (samePath(src, dest)) { note(`  = ${dest} (уже актуален)`); continue; }
+    backupExisting(dest);
+    act(`  + ${dest}`, () => { mkdirSync(binDir, { recursive: true }); cpSync(src, dest); chmodSync(dest, 0o755); });
+  }
+
   // 2. секция-диспетчер в файлы инструкций
   const sections = [pipelineSectionProject];
   for (const rel of projectInstructions) {
@@ -360,6 +372,13 @@ function removeProjectMode() {
     act(`  − ${target}`, () => rmSync(target, { recursive: true, force: true }));
   }
   for (const rel of entry.instructions) stripSectionsInFile(instrFile(rel));
+  for (const name of toolNames) {
+    const target = join(projectDir, ".agents", "bin", name);
+    if (!existsSync(target)) continue;
+    backupExisting(target);
+    act(`  − ${target}`, () => rmSync(target, { force: true }));
+  }
+  // данные фабрики (tasks/, .agents/events.jsonl, lessons, decisions) — это работа проекта, не тулкита: не удаляем
 
   const hooksDir = join(projectDir, ".githooks");
   for (const name of Object.keys(HOOKS)) {

@@ -1,0 +1,11 @@
+{
+  "_comment": "Пример <проект>/.agents/gate.json. Всё опционально. gates — любые команды (не только npm), по порядку, fail-fast; без gates берутся npm-скрипты lint/typecheck/complexity/test/tlc. protected — необратимое (деньги, касса, внешние системы): коммит туда только с AGENT_TOOLKIT_HUMAN_APPROVED=1, выставленным человеком.",
+  "timeoutSec": 120,
+  "gates": [
+    { "name": "lint", "run": "ruff check ." },
+    { "name": "complexity", "run": "xenon --max-absolute B --max-modules A --max-average A src" },
+    { "name": "test", "run": "pytest -q" },
+    { "name": "tlc", "run": "java -cp tla2tools.jar tlc2.TLC -config spec/tla/Transfer.cfg spec/tla/Transfer.tla" }
+  ],
+  "protected": ["src/billing/**", "src/cashdesk/**", "migrations/", "src/integrations/payments/**"]
+}
