@@ -1,0 +1,9 @@
+{
+  "_comment": "Роли конвейера → bb-провайдер, модель, усилие, окружение. Проверяющие (verifier/tester/critic) обязаны быть на модели, отличной от executor — factory.mjs это проверяет. Переопределить для проекта: <репо>/.agents/factory.json (только изменённые поля).",
+  "roles": {
+    "executor": { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash", "reasoning": "high", "environment": "new-worktree" },
+    "verifier": { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" },
+    "tester":   { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" },
+    "critic":   { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" }
+  }
+}

@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { tempRepo, write, commit, gatePayload, sh } from "./helpers.mjs";
+import { cpSync, mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { tempRepo, write, commit, gatePayload, sh, kitRoot } from "./helpers.mjs";
 
 test("gate.json: красная произвольная команда блокирует коммит, зелёная пропускает", () => {
   const red = tempRepo({ gateConfig: { gates: [{ name: "lint", run: "exit 3" }] } });
@@ -121,11 +124,86 @@ test("ревью №4: сокращения, чужой --help и склейка
 });
 
 test("ревью №6: лог событий и lock-файлы доски не считаются расхождением дерева", () => {
-  const dir = tempRepo({ gateConfig: { gates: [] } });
+  const dir = tempRepo({ gateConfig: { gates: [{ name: "ok", run: "true" }] } });
   write(dir, ".agents/events.jsonl", "{}\n");
   write(dir, "tasks/.locks/1.lock", "1");
   write(dir, "a.txt", "1");
   sh(dir, "git", ["add", "a.txt"]);
   const r = sh(dir, "git", ["commit", "-q", "-m", "x [no-checklist]"]);
   assert.equal(r.status, 0, r.stderr);
+});
+
+test("неотслеживаемый файл при наличии гейтов — блок (тесты видят файл, коммит — нет)", () => {
+  const dir = tempRepo({ gateConfig: { gates: [{ name: "ok", run: "true" }] } });
+  write(dir, "new-module.js", "1");
+  write(dir, "a.txt", "1");
+  sh(dir, "git", ["add", "a.txt"]);
+  const r = sh(dir, "git", ["commit", "-q", "-m", "x [no-checklist]"]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /new-module\.js/);
+});
+
+// глобальный хук: файл гейта лежит вне репозитория (~/.agent-toolkit/gate/pre-commit),
+// репозиторий определяется по cwd из payload Claude Code
+function globalGate() {
+  const dir = mkdtempSync(join(tmpdir(), "atk-global-"));
+  mkdirSync(join(dir, "gate"));
+  cpSync(join(kitRoot, "gate", "pre-commit"), join(dir, "gate", "pre-commit"));
+  return (cwd, command) => sh(tmpdir(), "node", [join(dir, "gate", "pre-commit")], { input: JSON.stringify({ cwd, tool_input: { command } }) });
+}
+function plainRepo(gateConfig) {
+  const dir = mkdtempSync(join(tmpdir(), "atk-plain-"));
+  sh(dir, "git", ["init", "-q"]);
+  if (gateConfig) write(dir, ".agents/gate.json", JSON.stringify(gateConfig));
+  sh(dir, "git", ["add", "-A"]);
+  sh(dir, "git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+  return dir;
+}
+
+test("глобальный гейт: гейтит репозиторий из cwd payload'а", () => {
+  const gate = globalGate();
+  const red = plainRepo({ gates: [{ name: "lint", run: "exit 1" }] });
+  const r = gate(red, 'git commit -m "x"');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /гейт `lint` упал/);
+  assert.equal(gate(plainRepo({ gates: [{ name: "ok", run: "true" }] }), 'git commit -m "x"').status, 0);
+});
+
+test("глобальный гейт: проект без настроек — коммит проходит с предупреждением, обход всё равно блокируется", () => {
+  const gate = globalGate();
+  const bare = plainRepo();
+  write(bare, "untracked.txt", "1");
+  const r = gate(bare, 'git commit -m "x"');
+  assert.equal(r.status, 0, "без гейтов сверка дерева не нужна");
+  assert.match(r.stderr, /НЕПРОВЕРЕННЫМ/);
+  assert.equal(gate(bare, "git commit --no-verify -m x").status, 2);
+});
+
+test("глобальный гейт: вне git — пропуск; в проекте со своим git-хуком — гейт не дублируется", () => {
+  const gate = globalGate();
+  assert.equal(gate(mkdtempSync(join(tmpdir(), "atk-nogit-")), "git commit -m x").status, 0);
+  const own = tempRepo({ gateConfig: { gates: [{ name: "slow", run: "touch ran-twice" }] } });
+  assert.equal(gate(own, "git commit -m x").status, 0);
+  assert.equal(sh(own, "test", ["-e", "ran-twice"]).status, 1, "гейт прогонит git-хук проекта");
+  assert.equal(gate(own, "git commit -n -m x").status, 2, "обход проверяется и здесь");
+});
+
+test("глобальный гейт: репозиторий из `cd X && git commit` и `git -C X commit`, а не из cwd сессии", () => {
+  const gate = globalGate();
+  const session = plainRepo();
+  const red = plainRepo({ gates: [{ name: "lint", run: "exit 1" }] });
+  assert.equal(gate(session, `cd ${red} && git commit -m x`).status, 2);
+  assert.equal(gate(session, `cd '${red}' && git add -A && git commit -m x`).status, 2);
+  assert.equal(gate(session, `git -C ${red} commit -m x`).status, 2);
+  assert.equal(gate(session, "git commit -m x").status, 0, "без cd — репозиторий сессии");
+});
+
+test("адаптер: «git commit» внутри heredoc и строки — не коммит (ложное срабатывание вживую)", () => {
+  const dir = tempRepo({ gateConfig: { gates: [{ name: "x", run: "exit 1" }] } });
+  write(dir, "dirty.txt", "1"); // дерево расходится: настоящий коммит был бы заблокирован
+  const heredoc = "cat >> README.md <<'EOF'\nЗапусти git commit --no-verify -m x\nEOF";
+  assert.equal(gatePayload(dir, heredoc).status, 0, heredoc);
+  assert.equal(gatePayload(dir, "python3 - <<'PY'\nprint('git commit')\nPY").status, 0);
+  assert.equal(gatePayload(dir, 'echo "не делай git commit -n"').status, 0);
+  assert.equal(gatePayload(dir, "cat > a <<EOF\ntext\nEOF\ngit commit -m x").status, 2, "коммит после heredoc ловится");
 });

@@ -22,8 +22,8 @@ description: Use when accepted work is heading to production — "выкатыв
 
 ## 3. Замер скорости
 
-1. Прогони бенчмарк проекта на кандидате (сценарии из радиуса поражения + горячие пути). Результат — JSON «метрика → число» (см. формат в `.agents/bin/bench-compare.mjs`).
-2. `node .agents/bin/bench-compare.mjs bench/current.json` — сравнение с `.agents/bench-baseline.json`.
+1. Прогони бенчмарк проекта на кандидате (сценарии из радиуса поражения + горячие пути). Результат — JSON «метрика → число» (см. формат в `<bin>/bench-compare.mjs`).
+2. `node <bin>/bench-compare.mjs bench/current.json` — сравнение с `.agents/bench-baseline.json`.
 3. **Медленнее больше чем на 10 % — не выкатываем** (exit 2). Не «в пределах шума», не «потом оптимизируем»: либо чиним, либо владелец явно меняет базовую линию (`--update-baseline`) с записью в `docs/decisions.md`.
 4. Замеры — на одной и той же машине/окружении; первый прогон выбрасывается (прогрев); каждую метрику — медиана из ≥ 5 прогонов.
 

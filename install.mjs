@@ -8,7 +8,8 @@
 //   --profile            # + профиль-секция в пользовательские файлы инструкций
 //   --skills-dir <путь>  # явная цель для скиллов (Pi, Qoder, Antigravity, ...)
 //   --zcode-hook         # (project) PreToolUse-адаптер ZCode (.zcode/config.json)
-//   --claude-hook        # (project) PreToolUse-адаптер Claude Code (.claude/settings.json)
+//   --claude-hook        # PreToolUse-гейт Claude Code: с --project — в .claude/settings.json проекта,
+//                        # без — глобально в ~/.claude/settings.json (гейт на git commit в любом проекте)
 //   --instructions <файл># доп. файл инструкций (CLAUDE.md, QODER.md, ...) — можно несколько
 //   --dry-run            # показать план, ничего не менять
 //   --remove             # убрать установленное (по манифесту); флаги те же
@@ -24,7 +25,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
@@ -46,7 +47,7 @@ const dryRun = has("dry-run");
 const remove = has("remove");
 
 if (has("version")) { console.log(VERSION); process.exit(0); }
-if (has("help")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(2, 18).join("\n")); process.exit(0); }
+if (has("help")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(2, 20).join("\n")); process.exit(0); }
 for (const [name, minValues] of [["project", 1], ["skills-dir", 1], ["instructions", 1]]) {
   if (has(name) && values(name).filter((v) => v !== "").length < minValues) {
     console.error(`--${name} требует значение`);
@@ -61,9 +62,43 @@ const skillNames = readdirSync(join(kitRoot, "skills")).filter((n) => existsSync
 const pipelineTemplate = readFileSync(join(kitRoot, "agents", "pipeline-section.md"), "utf8").trim();
 // project-режим кладёт скиллы в .agents/skills (нативно сканирует OpenCode;
 // остальные harness'ы находят их по индексу в секции AGENTS.md)
-const sectionFor = (dir) => pipelineTemplate.replaceAll("{{SKILLS_DIR}}", dir);
-const pipelineSectionProject = sectionFor("`.agents/skills/` от корня репозитория");
-const pipelineSectionUser = sectionFor("родной каталог скиллов текущего harness'а (например `~/.claude/skills/`, `~/.zcode/skills/`)");
+const sectionFor = (dir, bin) => pipelineTemplate.replaceAll("{{SKILLS_DIR}}", dir).replaceAll("{{BIN_DIR}}", bin);
+const pipelineSectionProject = sectionFor("`.agents/skills/` от корня репозитория", "`.agents/bin/` от корня репозитория");
+const pipelineSectionUser = sectionFor(
+  "родной каталог скиллов текущего harness'а (например `~/.claude/skills/`, `~/.zcode/skills/`)",
+  "`.agents/bin/` проекта, если он есть, иначе `~/.agent-toolkit/bin/`"
+);
+// роль CTO-оркестратора — для главной сессии Claude Code; исполнители и проверяющие —
+// bb-треды, которые запускает tools/factory.mjs по roles/*.md и factory.json
+const orchestratorSection = readFileSync(join(kitRoot, "agents", "orchestrator-section.md"), "utf8").trim().replaceAll("{{KIT_DIR}}", kitRoot.replace(/[\\/]$/, ""));
+const roleFiles = readdirSync(join(kitRoot, "roles")).filter((n) => n.endsWith(".md"));
+
+// роли фабрики рядом с инструментами: <base>/roles/*.md + <base>/factory.json.
+// factory.json — настройка владельца (модели): кладём, только если его нет; не перезаписываем
+function installFactory(base) {
+  for (const name of roleFiles) {
+    const src = join(kitRoot, "roles", name);
+    const dest = join(base, "roles", name);
+    if (samePath(src, dest)) { note(`  = ${dest} (уже актуален)`); continue; }
+    backupExisting(dest);
+    act(`  + ${dest}`, () => { mkdirSync(join(base, "roles"), { recursive: true }); cpSync(src, dest); });
+  }
+  const cfg = join(base, "factory.json");
+  if (existsSync(cfg)) note(`  = ${cfg} (есть — модели владельца не трогаю)`);
+  else act(`  + ${cfg}`, () => { mkdirSync(base, { recursive: true }); cpSync(join(kitRoot, "factory.json"), cfg); });
+}
+function removeFactory(base) {
+  for (const name of roleFiles) {
+    const target = join(base, "roles", name);
+    if (existsSync(target)) act(`  − ${target}`, () => rmSync(target, { force: true }));
+  }
+  const cfg = join(base, "factory.json");
+  if (existsSync(cfg) && samePath(join(kitRoot, "factory.json"), cfg)) act(`  − ${cfg}`, () => rmSync(cfg, { force: true }));
+  else if (existsSync(cfg)) note(`  = ${cfg} (изменён владельцем — оставлен)`);
+}
+// глобальный слой исполняемого: инструменты и гейт для любого репозитория
+const userBinDir = join(metaRoot, "bin");
+const userGatePath = join(metaRoot, "gate", "pre-commit");
 const profileSection = [
   "<!-- agent-toolkit:profile:start -->",
   readFileSync(join(kitRoot, "profile", "AGENTS-user.md"), "utf8").trim(),
@@ -168,8 +203,21 @@ const instrTargets = [
   ...values("instructions").map((p) => resolve(p)),
 ];
 
+function copyExecutable(src, dest) {
+  if (samePath(src, dest)) { note(`  = ${dest} (уже актуален)`); return; }
+  backupExisting(dest);
+  act(`  + ${dest}`, () => { mkdirSync(join(dest, ".."), { recursive: true }); cpSync(src, dest); chmodSync(dest, 0o755); });
+}
+
+const claudeGlobalHookEntry = () => ({
+  matcher: "Bash",
+  hooks: [{ type: "command", command: `node "${userGatePath}"`, timeout: 420 }],
+});
+
 function installUserMode() {
   const sections = [pipelineSectionUser, ...(has("profile") ? [profileSection] : [])];
+  const claudeHome = join(homedir(), ".claude");
+  const claudeDetected = detected.some((h) => h.id === "claude");
   if (skillsTargets.length === 0 && instrTargets.length === 0) {
     console.error("Не нашёл установленных harness'ов (claude/zcode/codex/opencode).\n" +
       "Варианты: --project <путь> (универсально, работает везде), --skills-dir <путь>, либо создай каталог harness'а и повтори.");
@@ -184,10 +232,52 @@ function installUserMode() {
   if (instrTargets.length > 0 || skillsTargets.length > 0) {
     for (const file of instrTargets) {
       console.log(`Инструкции → ${file}`);
-      upsertSectionsInFile(file, sections);
+      const isClaude = claudeDetected && resolve(file) === resolve(join(claudeHome, "CLAUDE.md"));
+      upsertSectionsInFile(file, isClaude ? [...sections, orchestratorSection] : sections);
       if (!dryRun) { manifest.userInstructionFiles = [...new Set([...manifest.userInstructionFiles, file])]; }
     }
   }
+  // исполняемый слой: доска, бенч и гейт — общие для всех проектов
+  if (skillsTargets.length > 0 || instrTargets.length > 0) {
+    console.log(`Инструменты → ${userBinDir}/, гейт → ${userGatePath}`);
+    for (const name of toolNames) copyExecutable(join(kitRoot, "tools", name), join(userBinDir, name));
+    copyExecutable(join(kitRoot, "gate", "pre-commit"), userGatePath);
+    if (!dryRun) manifest.userTools = true;
+  }
+
+  // роли фабрики (bb-треды) — рядом с глобальными инструментами
+  if (skillsTargets.length > 0 || instrTargets.length > 0) {
+    console.log(`Роли фабрики → ${metaRoot}/roles/ (${roleFiles.map((n) => n.replace(/\.md$/, "")).join(", ")}) + factory.json`);
+    installFactory(metaRoot);
+  }
+
+  // миграция с 3.1-черновика: субагенты Claude заменены bb-тредами — убрать установленные
+  for (const target of manifest.userClaudeAgents ?? []) {
+    if (!existsSync(target)) continue;
+    backupExisting(target);
+    act(`  − ${target} (субагенты Claude заменены bb-тредами)`, () => rmSync(target, { force: true }));
+  }
+  if (!dryRun) delete manifest.userClaudeAgents;
+
+  // Claude Code: (по флагу) глобальный гейт-хук
+  if (claudeDetected) {
+    if (has("claude-hook")) {
+      const settings = join(claudeHome, "settings.json");
+      console.log(`Глобальный гейт Claude Code → ${settings}`);
+      upsertAdapterConfig(settings, (c) => {
+        c.hooks ??= {};
+        const arr = (c.hooks.PreToolUse ??= []);
+        if (JSON.stringify(arr).includes(".agent-toolkit/gate/pre-commit")) return null;
+        arr.push(claudeGlobalHookEntry());
+        return c;
+      });
+      if (!dryRun) manifest.userClaudeHook = settings;
+    }
+  } else if (has("claude-hook")) {
+    console.error("--claude-hook: Claude Code не найден (~/.claude отсутствует) — глобальный хук не ставлю.");
+    process.exitCode = 1;
+  }
+
   if (has("profile") && instrTargets.length === 0) {
     console.error("--profile: не найдено файлов пользовательских инструкций (см. список выше) — профиль не вставлен.");
     process.exitCode = 1;
@@ -212,8 +302,39 @@ function removeUserMode() {
     }
   }
   for (const file of manifest.userInstructionFiles ?? []) stripSectionsInFile(file);
+  for (const target of manifest.userClaudeAgents ?? []) {
+    if (!existsSync(target)) continue;
+    backupExisting(target);
+    act(`  − ${target}`, () => rmSync(target, { force: true }));
+  }
+  if (manifest.userTools) {
+    for (const target of [...toolNames.map((n) => join(userBinDir, n)), userGatePath]) {
+      if (!existsSync(target)) continue;
+      act(`  − ${target}`, () => rmSync(target, { force: true }));
+    }
+    removeFactory(metaRoot);
+  }
+  if (manifest.userClaudeHook && existsSync(manifest.userClaudeHook)) {
+    const file = manifest.userClaudeHook;
+    try {
+      const config = JSON.parse(readFileSync(file, "utf8"));
+      const arr = config.hooks?.PreToolUse;
+      if (Array.isArray(arr)) {
+        const filtered = arr.filter((g) => !JSON.stringify(g).includes(".agent-toolkit/gate/pre-commit"));
+        if (filtered.length !== arr.length) {
+          if (filtered.length) config.hooks.PreToolUse = filtered; else delete config.hooks.PreToolUse;
+          if (Object.keys(config.hooks).length === 0) delete config.hooks;
+          backupExisting(file);
+          act(`  − ${file} (глобальный гейт удалён)`, () => writeFileSync(file, JSON.stringify(config, null, 2) + "\n"));
+        }
+      }
+    } catch { console.error(`  ${file} не парсится — хук не удалён, убери запись вручную`); }
+  }
   manifest.userSkillsDirs = [];
   manifest.userInstructionFiles = [];
+  delete manifest.userClaudeAgents;
+  delete manifest.userTools;
+  delete manifest.userClaudeHook;
 }
 
 // --- project-режим ---
@@ -289,6 +410,8 @@ function installProjectMode() {
     backupExisting(dest);
     act(`  + ${dest}`, () => { mkdirSync(binDir, { recursive: true }); cpSync(src, dest); chmodSync(dest, 0o755); });
   }
+
+  installFactory(join(projectDir, ".agents"));
 
   // 2. секция-диспетчер в файлы инструкций
   const sections = [pipelineSectionProject];
@@ -378,6 +501,7 @@ function removeProjectMode() {
     backupExisting(target);
     act(`  − ${target}`, () => rmSync(target, { force: true }));
   }
+  removeFactory(join(projectDir, ".agents"));
   // данные фабрики (tasks/, .agents/events.jsonl, lessons, decisions) — это работа проекта, не тулкита: не удаляем
 
   const hooksDir = join(projectDir, ".githooks");

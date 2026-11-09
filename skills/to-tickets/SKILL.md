@@ -1,6 +1,6 @@
 ---
 name: to-tickets
-description: Use when a spec or CHECKLIST.md must be turned into tickets that several agents can pick up in parallel — "нарежь на тикеты", "to tickets", "раздай задачи агентам", "заведи задачи на доску", "распараллель работу", or when a teamlead is about to dispatch executors. Writes tasks/NNN-<slug>.md with frontmatter (status, depends_on, mode waterfall/parallel, priority, human, models) that the board tool (.agents/bin/board.mjs) understands.
+description: Use when a spec or CHECKLIST.md must be turned into tickets that several agents can pick up in parallel — "нарежь на тикеты", "to tickets", "раздай задачи агентам", "заведи задачи на доску", "распараллель работу", or when a teamlead is about to dispatch executors. Writes tasks/NNN-<slug>.md with frontmatter (status, depends_on, mode waterfall/parallel, priority, human, models) that the board tool (<bin>/board.mjs) understands.
 ---
 
 # Спека → тикеты на общей доске
@@ -46,13 +46,13 @@ verifier_model: <ДРУГАЯ модель — проверяет всегда �
 
 ## После нарезки
 
-- `node .agents/bin/board.mjs list` — покажи пользователю граф: что параллелится, что ждёт.
+- `node <bin>/board.mjs list` — покажи пользователю граф: что параллелится, что ждёт.
 - Сообщи: N тикетов, сколько параллельных потоков, какие `human: required`.
 
 ## Протокол доски (для исполнителей)
 
 ```bash
-B="node .agents/bin/board.mjs"
+B="node <bin>/board.mjs"
 $B next                                   # что можно брать
 $B claim 007 --as exec-sonnet-1           # атомарно; занятое не возьмёшь
 $B log "начал, план: ..." --as exec-sonnet-1 --ticket 007

@@ -40,9 +40,64 @@ main().catch((e) => {
 async function main() {
   const { spawnSync } = await import("node:child_process");
   const { existsSync, readFileSync } = await import("node:fs");
-  const { dirname, join, resolve } = await import("node:path");
+  const { basename, dirname, join, resolve } = await import("node:path");
 
-  const repoDir = dirname(dirname(resolve(process.argv[1])));
+  // --- где мы: хук проекта (<репо>/.githooks/pre-commit) или глобальный хук harness'а ---
+
+  const scriptDir = dirname(resolve(process.argv[1]));
+  const inRepoHook = basename(scriptDir) === ".githooks";
+  const rawStdin = (() => {
+    if (process.stdin.isTTY) return ""; // ручной запуск без payload — прямой режим
+    try {
+      return readFileSync(0, "utf8");
+    } catch {
+      return "";
+    }
+  })();
+  let payloadCwd = null;
+  let payloadCommand = "";
+  try {
+    const payload = rawStdin.trim() ? JSON.parse(rawStdin) : null;
+    payloadCwd = payload?.cwd ?? null;
+    const c = payload?.tool_input?.command ?? payload?.input?.command ?? "";
+    payloadCommand = typeof c === "string" ? c : "";
+  } catch {
+    payloadCwd = null;
+  }
+
+  // Исполняемая часть команды: без тел heredoc и содержимого кавычек. Иначе файл или
+  // сообщение со словами «git commit» внутри (`cat > README <<EOF … EOF`) — ложный коммит.
+  // Цена: `sh -c "git commit"` адаптер не увидит — его догонит git-хук проекта.
+  const stripHeredocs = (command) =>
+    command.replace(/<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1[^\n]*\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, "<<heredoc");
+  const codeOnly = (command) =>
+    stripHeredocs(command)
+      .replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, (q) => (/[\s;&|]/.test(q) ? '""' : q));
+
+  // каталог коммита — из самой команды: `cd <dir> && git commit`, `git -C <dir> commit`
+  const unquote = (t) => t.replace(/^(["'])(.*)\1$/, "$2");
+  const expandHome = (t) => (t === "~" || t.startsWith("~/") ? join(process.env.HOME || process.env.USERPROFILE || "", t.slice(1)) : t);
+  const commitDir = (command, base) => {
+    const code = codeOnly(command);
+    const commitAt = code.search(/\bgit\b[^\n|;&]*\bcommit\b/);
+    if (commitAt < 0) return base;
+    let dir = base;
+    for (const m of code.slice(0, commitAt).matchAll(/(?:^|[;&|]\s*|\(\s*)cd\s+("[^"]*"|'[^']*'|[^\s;&|)]+)/g)) {
+      dir = resolve(dir, expandHome(unquote(m[1])));
+    }
+    const gitC = code.slice(commitAt).match(/^git\s+(?:-c\s+\S+\s+)*-C\s+("[^"]*"|'[^']*'|\S+)/);
+    if (gitC) dir = resolve(dir, expandHome(unquote(gitC[1])));
+    return dir;
+  };
+
+  const gitTop = (dir) => {
+    const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : null;
+  };
+  // глобальный хук (~/.agent-toolkit/gate/pre-commit) гейтит тот репозиторий, где агент коммитит
+  const sessionDir = payloadCwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const repoDir = inRepoHook ? dirname(scriptDir) : gitTop(commitDir(payloadCommand, sessionDir));
+  if (!repoDir) process.exit(0); // не git-репозиторий — коммитить нечего
   const DEFAULT_NPM_GATES = ["lint", "typecheck", "complexity", "test", "tlc"];
   const HUMAN_ENV = "AGENT_TOOLKIT_HUMAN_APPROVED";
 
@@ -70,14 +125,6 @@ async function main() {
 
   // --- stdin / режим ---
 
-  const readStdin = () => {
-    if (process.stdin.isTTY) return ""; // ручной запуск без payload — прямой режим
-    try {
-      return readFileSync(0, "utf8");
-    } catch {
-      return "";
-    }
-  };
 
   const commandFrom = (raw) => {
     if (!raw) return null;
@@ -96,15 +143,16 @@ async function main() {
     if (!command) return false;
     // `git ... commit`, включая `git -C path commit`; справка — только если она в самом
     // commit-сегменте (`... && ls --help` не делает коммит справкой)
-    return commitSegments(command).some((seg) => !/\s--help\b/.test(seg) && !/\bgit\s+help\b/.test(seg));
+    return commitSegments(codeOnly(command)).some((seg) => !/\s--help\b/.test(seg) && !/\bgit\s+help\b/.test(seg));
   };
 
   // обход проверок агентом: смотрим на команду без содержимого кавычек (сообщение коммита
   // может законно содержать «-n» или «--no-verify» как текст)
   const bypassAttempt = (command) => {
-    const bare = command.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '""');
+    const code = stripHeredocs(command);
+    const bare = code.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '""');
     // без кавычек и экранирования: `HUMAN_''APPROVED`, `core."hooksPath"` склеиваются обратно
-    const glued = command.replace(/['"\\]/g, "");
+    const glued = code.replace(/['"\\]/g, "");
     for (const seg of commitSegments(bare)) {
       // git принимает однозначные сокращения длинных опций: --no-veri, --no-verif
       if (/\s--no-veri[a-z]*\b/.test(seg)) return "`--no-verify` отключает гейт";
@@ -223,7 +271,7 @@ async function main() {
 
   // --- запуск ---
 
-  const raw = readStdin();
+  const raw = rawStdin;
   if (raw.trim().length > 0) {
     // payload-режим (ZCode/Claude Code): гейтим только `git commit`.
     // Пустой stdin — прямой режим git-хука: гейтим всегда.
@@ -234,9 +282,12 @@ async function main() {
       console.error(`[gate] Коммит заблокирован: ${bypass}. Агент не обходит свои проверки — почини причину или спроси человека.`);
       process.exit(2);
     }
+    // глобальный хук в проекте со своим git-хуком тулкита: обход проверен, гейт прогонит git-хук
+    if (!inRepoHook) {
+      const hooksPath = spawnSync("git", ["config", "--get", "core.hooksPath"], { cwd: repoDir, encoding: "utf8" }).stdout?.trim();
+      if (hooksPath === ".githooks" && existsSync(join(repoDir, ".githooks", "pre-commit"))) process.exit(0);
+    }
   }
-
-  if (!treeMatchesIndex()) process.exit(2);
 
   const violations = protectedViolations();
   if (violations.length > 0) {
@@ -262,6 +313,9 @@ async function main() {
     console.error(`[gate] гейты не объявлены (package.json: ${DEFAULT_NPM_GATES.join("/")}; или .agents/gate.json) — коммит проходит НЕПРОВЕРЕННЫМ.`);
     process.exit(0);
   }
+
+  // сверка дерева нужна только тем, кто гоняет проверки: без гейтов сверять нечего
+  if (!treeMatchesIndex()) process.exit(2);
 
   for (const g of gates) {
     // fail-fast: первый упавший гейт останавливает — гонять остальные на красном дереве бессмысленно
