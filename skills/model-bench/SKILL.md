@@ -1,6 +1,6 @@
 ---
 name: model-bench
-description: Use when choosing or re-evaluating which models fill which factory roles — "какую модель взять", "сравни модели", "бенчмарк моделей на наших задачах", "model bench", "обнови roles.md", or after a new model release. Benchmarks candidate models on the project's own real tasks (past tickets with known accepted outcomes), scoring by the factory's own acceptance (gate, interrogate, mutations, judge) rather than public leaderboards, and proposes an updated .agents/roles.md.
+description: Use when choosing or re-evaluating which models fill which factory roles — "какую модель взять", "сравни модели", "бенчмарк моделей на наших задачах", "model bench", "обнови агентов фабрики", or after a new model release. Benchmarks candidate models on the project's own real tasks (past tickets with known accepted outcomes), scoring by the factory's own acceptance (gate, interrogate, mutations, judge) rather than public leaderboards, and proposes updated factory.json workers.
 ---
 
 # Бенчмарк моделей на своих задачах
@@ -27,4 +27,4 @@ description: Use when choosing or re-evaluating which models fill which factory 
 
 ## 4. Результат
 
-`docs/research/model-bench-YYYY-MM-DD.md`: таблица модель × метрика, и главное — **профиль ошибок** каждой модели (в чём ошибается систематически). Предложение по `.agents/roles.md`: кто тимлид, кто исполнитель, кто проверяет кого (пары с непересекающимися профилями ошибок — лучшие пары «исполнитель → проверяющий»). Изменение ролей — решение владельца.
+`docs/research/model-bench-YYYY-MM-DD.md`: таблица модель × метрика, и главное — **профиль ошибок** каждой модели (в чём ошибается систематически). Предложение по `factory.json → workers`: кто тимлид, кто исполнитель, кто проверяет кого (пары с непересекающимися профилями ошибок — лучшие пары «исполнитель → проверяющий»). Изменение ролей — решение владельца.

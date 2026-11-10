@@ -19,7 +19,7 @@ mode: parallel         # parallel — независим; waterfall — ждёт
 depends_on: [003, 005]
 checklist: 2.3         # пункт CHECKLIST.md, если есть
 human: required        # только для необратимого: деньги, данные, доступы, внешние системы
-executor_model: <модель исполнителя — из .agents/roles.md>
+executor_model: <модель исполнителя — из `factory workers`, заполняет оркестратор при раздаче>
 verifier_model: <ДРУГАЯ модель — проверяет всегда другая>
 ---
 ## Что сделать
@@ -41,7 +41,7 @@ verifier_model: <ДРУГАЯ модель — проверяет всегда �
 2. **Водопад vs параллель.** Что зависит друг от друга — `mode: waterfall` + `depends_on` (доска не даст взять раньше). Независимое — `parallel`, и тогда тикеты **не пересекаются по файлам**: секция «Не трогать» обязательна.
 3. Каждому тикету — финишная черта с типом артефакта (из спеки). Без неё тикет не заводится.
 4. Необратимое — `human: required`: в `done` его переводит только человек.
-5. Модели — из `.agents/roles.md` (скилл `teamlead`); `verifier_model ≠ executor_model` — доска это проверяет.
+5. Модели — из `factory workers` (скилл `teamlead`); `verifier_model ≠ executor_model` — доска это проверяет.
 6. Нумерация сквозная, номера не переиспользуются.
 
 ## После нарезки
@@ -54,12 +54,12 @@ verifier_model: <ДРУГАЯ модель — проверяет всегда �
 ```bash
 B="node <bin>/board.mjs"
 $B next                                   # что можно брать
-$B claim 007 --as exec-sonnet-1           # атомарно; занятое не возьмёшь
-$B log "начал, план: ..." --as exec-sonnet-1 --ticket 007
-$B status 007 review --as exec-sonnet-1 --note "артефакты: docs/acceptance/007.md"
+$B claim 007 --as exec-1           # атомарно; занятое не возьмёшь
+$B log "начал, план: ..." --as exec-1 --ticket 007
+$B status 007 review --as exec-1 --note "артефакты: docs/acceptance/007.md"
 # принимает ДРУГОЙ агент:
-$B status 007 done --as verifier-astra --note "сценарии S1,S2 подтверждены записью"
-$B msg teamlead "вопрос: ..." --as exec-sonnet-1 --ticket 007
+$B status 007 done --as verifier-1 --note "сценарии S1,S2 подтверждены записью"
+$B msg teamlead "вопрос: ..." --as exec-1 --ticket 007
 ```
 
 Доска одна на репозиторий: из любого git worktree команда находит основной рабочий каталог (общий `.git`), так что исполнители в отдельных worktree видят ту же доску. Вне git — задай `BOARD_ROOT`. Тикеты — плоский frontmatter (`ключ: значение`, списки в строку `[1, 2]`); block-YAML доска отвергает с ошибкой, а не теряет.

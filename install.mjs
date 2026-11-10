@@ -26,7 +26,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
@@ -85,8 +85,16 @@ function installFactory(base) {
     act(`  + ${dest}`, () => { mkdirSync(join(base, "roles"), { recursive: true }); cpSync(src, dest); });
   }
   const cfg = join(base, "factory.json");
-  if (existsSync(cfg)) note(`  = ${cfg} (есть — модели владельца не трогаю)`);
-  else act(`  + ${cfg}`, () => { mkdirSync(base, { recursive: true }); cpSync(join(kitRoot, "factory.json"), cfg); });
+  let legacy = false;
+  if (existsSync(cfg)) {
+    try { const c = JSON.parse(readFileSync(cfg, "utf8")); legacy = Boolean(c.roles) && !c.workers; } catch { legacy = false; }
+  }
+  if (existsSync(cfg) && !legacy) note(`  = ${cfg} (есть — агентов владельца не трогаю)`);
+  else if (legacy) {
+    // старый формат 3.1–3.2 (модели зашиты в роли) factory.mjs больше не читает: заменяем, старое — в бэкап
+    backupExisting(cfg);
+    act(`  + ${cfg} (старый формат «roles» → «workers»; прежний — в бэкапе, перенеси свои модели, если меняли)`, () => cpSync(join(kitRoot, "factory.json"), cfg));
+  } else act(`  + ${cfg}`, () => { mkdirSync(base, { recursive: true }); cpSync(join(kitRoot, "factory.json"), cfg); });
 }
 function removeFactory(base) {
   for (const name of roleFiles) {

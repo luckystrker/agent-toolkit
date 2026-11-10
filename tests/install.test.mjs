@@ -82,7 +82,7 @@ test("user-режим для Claude Code: скиллы, роль оркестр�
 test("factory.json владельца не перезаписывается и переживает --remove; старые субагенты Claude убираются", () => {
   const home = mkdtempSync(join(tmpdir(), "atk-home-"));
   mkdirSync(join(home, ".claude"));
-  write(home, ".agent-toolkit/factory.json", '{"roles":{"executor":{"provider":"p","model":"мой"}}}');
+  write(home, ".agent-toolkit/factory.json", '{"workers":{"мой":{"provider":"p","model":"мой"}}}');
   write(home, ".claude/agents/executor.md", "старый субагент");
   write(home, ".agent-toolkit/manifest.json", JSON.stringify({ version: "3.1.0", userSkillsDirs: [], userInstructionFiles: [], projects: [], userClaudeAgents: [join(home, ".claude/agents/executor.md")] }));
   const env = { ...process.env, HOME: home, USERPROFILE: home };
@@ -91,4 +91,16 @@ test("factory.json владельца не перезаписывается и �
   assert.ok(!existsSync(join(home, ".claude/agents/executor.md")), "миграция");
   assert.equal(sh(kitRoot, "node", [install, "--remove"], { env }).status, 0);
   assert.match(readFileSync(join(home, ".agent-toolkit/factory.json"), "utf8"), /мой/, "настройка владельца осталась");
+});
+
+test("factory.json старого формата (roles с моделями) заменяется новым, прежний — в бэкап", () => {
+  const home = mkdtempSync(join(tmpdir(), "atk-home-"));
+  mkdirSync(join(home, ".claude"));
+  write(home, ".agent-toolkit/factory.json", JSON.stringify({ roles: { executor: { provider: "p", model: "m" } } }));
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const r = sh(kitRoot, "node", [install, "--no-tla"], { env });
+  assert.equal(r.status, 0, r.stderr);
+  const cfg = JSON.parse(readFileSync(join(home, ".agent-toolkit/factory.json"), "utf8"));
+  assert.ok(cfg.workers && !cfg.roles);
+  assert.match(r.stdout, /бэкап: .*factory\.json/);
 });

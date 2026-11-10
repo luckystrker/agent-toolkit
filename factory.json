@@ -1,16 +1,7 @@
 {
-  "_comment": "Роли конвейера → bb-провайдер, модель, усилие, окружение. Исполнители делятся ~50/50: executor (DeepSeek V4.1 Flash, OpenCode) и executor-sonnet (Sonnet 5.5, Claude Code). Проверка перекрёстная (crossReview, ключ — провайдер треда исполнителя): что делал DeepSeek — проверяет Sonnet, что делал Sonnet — проверяет DeepSeek; factory.mjs не даст проверять тем же провайдером. Переопределить для проекта: <репо>/.agents/factory.json (только изменённые поля).",
-  "roles": {
-    "executor":        { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash", "reasoning": "high", "environment": "new-worktree" },
-    "executor-sonnet": { "provider": "claude-code", "model": "claude-sonnet-5-5", "reasoning": "high", "permission": "auto", "environment": "new-worktree" },
-    "verifier": { "reasoning": "high", "environment": "same", "crossReview": {
-      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
-      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } },
-    "tester":   { "reasoning": "high", "environment": "same", "crossReview": {
-      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
-      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } },
-    "critic":   { "reasoning": "high", "environment": "same", "crossReview": {
-      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
-      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } }
+  "_comment": "Агенты фабрики: кто выполняет роли (executor, verifier, tester, critic — роли зашиты в factory.mjs, промпты в roles/). Каждый агент = bb-провайдер (харнесс) + модель; имена — любые. Любой агент играет любую роль; исполнения делятся поровну; работу агента проверяет другой агент на другой модели — нужно минимум два агента на разных моделях. Провайдеры и модели машины: `bb provider list`, `bb provider models <провайдер>`. Только OpenAI — например два агента на codex с разными моделями. Для проекта — <репо>/.agents/factory.json: только изменённые поля, null убирает агента. strengths — подсказка оркестратору, кому что давать.",
+  "workers": {
+    "deepseek": { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash", "reasoning": "high", "strengths": "объёмное и механическое" },
+    "sonnet":   { "provider": "claude-code", "model": "claude-sonnet-5-5", "reasoning": "high", "permission": "auto", "strengths": "сложная логика" }
   }
 }
