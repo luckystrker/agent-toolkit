@@ -44,7 +44,7 @@ test("user-режим для Claude Code: скиллы, роль оркестр�
   write(home, ".claude/CLAUDE.md", "# мои правила\n");
   const env = { ...process.env, HOME: home, USERPROFILE: home };
 
-  const r = sh(kitRoot, "node", [install, "--claude-hook", "--profile"], { env });
+  const r = sh(kitRoot, "node", [install, "--claude-hook", "--profile", "--no-tla"], { env });
   assert.equal(r.status, 0, r.stderr);
   for (const s of readdirSync(join(kitRoot, "skills"))) assert.ok(existsSync(join(home, ".claude/skills", s, "SKILL.md")), s);
   const md = readFileSync(join(home, ".claude/CLAUDE.md"), "utf8");
@@ -62,7 +62,7 @@ test("user-режим для Claude Code: скиллы, роль оркестр�
   assert.equal(settings.hooks.PreToolUse.length, 2, "чужой хук сохранён, наш добавлен");
   assert.match(JSON.stringify(settings), /\.agent-toolkit\/gate\/pre-commit/);
 
-  const again = sh(kitRoot, "node", [install, "--claude-hook", "--profile"], { env });
+  const again = sh(kitRoot, "node", [install, "--claude-hook", "--profile", "--no-tla"], { env });
   assert.equal(JSON.parse(readFileSync(join(home, ".claude/settings.json"), "utf8")).hooks.PreToolUse.length, 2, "повторная установка не дублирует хук");
   assert.equal(again.status, 0);
 
@@ -86,7 +86,7 @@ test("factory.json владельца не перезаписывается и �
   write(home, ".claude/agents/executor.md", "старый субагент");
   write(home, ".agent-toolkit/manifest.json", JSON.stringify({ version: "3.1.0", userSkillsDirs: [], userInstructionFiles: [], projects: [], userClaudeAgents: [join(home, ".claude/agents/executor.md")] }));
   const env = { ...process.env, HOME: home, USERPROFILE: home };
-  assert.equal(sh(kitRoot, "node", [install], { env }).status, 0);
+  assert.equal(sh(kitRoot, "node", [install, "--no-tla"], { env }).status, 0);
   assert.match(readFileSync(join(home, ".agent-toolkit/factory.json"), "utf8"), /мой/);
   assert.ok(!existsSync(join(home, ".claude/agents/executor.md")), "миграция");
   assert.equal(sh(kitRoot, "node", [install, "--remove"], { env }).status, 0);

@@ -40,6 +40,7 @@ main().catch((e) => {
 async function main() {
   const { spawnSync } = await import("node:child_process");
   const { existsSync, readFileSync } = await import("node:fs");
+  const { homedir } = await import("node:os");
   const { basename, dirname, join, resolve } = await import("node:path");
 
   // --- где мы: хук проекта (<репо>/.githooks/pre-commit) или глобальный хук harness'а ---
@@ -304,7 +305,22 @@ async function main() {
     }
   }
 
-  const gates = resolveGates();
+  // модели TLA+ в проекте (spec/tla/**/X.tla + X.cfg) проверяются TLC всегда — явно объявлять
+  // гейт не нужно: без формальной проверки код с инвариантами не принимается
+  const modelGate = (declared) => {
+    if ((declared ?? []).some((g) => g.name === "tlc")) return null; // проект объявил свой
+    if (!existsSync(join(repoDir, "spec", "tla"))) return null;
+    const tlc = [join(repoDir, ".agents", "bin", "tlc.mjs"), join(scriptDir, "..", "bin", "tlc.mjs"), join(homedir(), ".agent-toolkit", "bin", "tlc.mjs")].find((p) => existsSync(p));
+    if (!tlc) {
+      console.error("[gate] в проекте есть spec/tla/, но нет tlc.mjs (agent-toolkit) — проверить модели нечем, блокирую. Установи: node <agent-toolkit>/install.mjs");
+      process.exit(2);
+    }
+    const found = spawnSync(process.execPath, [tlc, "--find"], { cwd: repoDir, encoding: "utf8" });
+    return found.status === 0 ? { name: "tlc", cmd: process.execPath, args: [tlc] } : null;
+  };
+  let gates = resolveGates();
+  const tlcGate = modelGate(gates);
+  if (tlcGate) gates = [...(gates ?? []), tlcGate];
   if (gates === null) {
     console.error("[gate] нет ни .agents/gate.json, ни package.json — гейтов нет, коммит проходит НЕПРОВЕРЕННЫМ.");
     process.exit(0);

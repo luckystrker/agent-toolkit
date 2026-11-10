@@ -1,9 +1,16 @@
 {
-  "_comment": "Роли конвейера → bb-провайдер, модель, усилие, окружение. Проверяющие (verifier/tester/critic) обязаны быть на модели, отличной от executor — factory.mjs это проверяет. Переопределить для проекта: <репо>/.agents/factory.json (только изменённые поля).",
+  "_comment": "Роли конвейера → bb-провайдер, модель, усилие, окружение. Исполнители делятся ~50/50: executor (DeepSeek V4.1 Flash, OpenCode) и executor-sonnet (Sonnet 5.5, Claude Code). Проверка перекрёстная (crossReview, ключ — провайдер треда исполнителя): что делал DeepSeek — проверяет Sonnet, что делал Sonnet — проверяет DeepSeek; factory.mjs не даст проверять тем же провайдером. Переопределить для проекта: <репо>/.agents/factory.json (только изменённые поля).",
   "roles": {
-    "executor": { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash", "reasoning": "high", "environment": "new-worktree" },
-    "verifier": { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" },
-    "tester":   { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" },
-    "critic":   { "provider": "acp-opencode", "model": "opencode-go/muse-spark-1.3-contributor", "reasoning": "high", "environment": "same" }
+    "executor":        { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash", "reasoning": "high", "environment": "new-worktree" },
+    "executor-sonnet": { "provider": "claude-code", "model": "claude-sonnet-5-5", "reasoning": "high", "permission": "auto", "environment": "new-worktree" },
+    "verifier": { "reasoning": "high", "environment": "same", "crossReview": {
+      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
+      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } },
+    "tester":   { "reasoning": "high", "environment": "same", "crossReview": {
+      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
+      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } },
+    "critic":   { "reasoning": "high", "environment": "same", "crossReview": {
+      "acp-opencode": { "provider": "claude-code", "model": "claude-sonnet-5-5", "permission": "auto" },
+      "claude-code":  { "provider": "acp-opencode", "model": "opencode-go/deepseek-v4.1-flash" } } }
   }
 }

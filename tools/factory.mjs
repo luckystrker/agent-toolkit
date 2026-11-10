@@ -5,12 +5,16 @@
 // конфигурации, правило «проверяет другая модель» проверяется кодом, а не словами.
 //
 //   factory roles                                   роли → провайдер/модель/окружение
-//   factory spawn <role> --task <файл|-> [--env <id|путь>] [--title "..."] [--dry-run]
+//   factory spawn <role> --task <файл|-> [--env <id|путь>] [--executor <thread-id>] [--title "..."] [--dry-run]
 //   factory env <thread-id>                         окружение треда: id, путь, ветка
 //
 // Роли и окружения по умолчанию:
 //   executor  — новый git worktree (каждый исполнитель изолирован, параллель безопасна)
-//   verifier, tester, critic — --env обязателен: окружение исполнителя (видят его дифф)
+//   verifier, tester, critic — работают в окружении исполнителя (видят его дифф).
+//     Перекрёстная проверка (`crossReview` в factory.json): модель проверяющего выбирается
+//     по провайдеру треда исполнителя (`--executor <thread-id>`; окружение берётся оттуда же):
+//     что делал DeepSeek — проверяет Sonnet, что делал Sonnet — проверяет DeepSeek.
+//     Без `crossReview` — старый режим: фиксированная модель и --env обязателен.
 // Тред создаётся дочерним к текущему (--parent-self): bb будит оркестратора, когда он
 // закончил ход, упал или ждёт ответа; итог роли — её финальный ответ.
 //
@@ -36,7 +40,7 @@ function die(msg, code = 1) { console.error(`[factory] ${msg}`); process.exit(co
 
 // --- аргументы ---
 const argv = process.argv.slice(2);
-const VALUED = new Set(["task", "env", "title", "project"]);
+const VALUED = new Set(["task", "env", "title", "project", "executor"]);
 const opts = {};
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
@@ -84,11 +88,19 @@ function loadConfig() {
   if (Object.keys(roles).length === 0) die(`нет конфигурации ролей (${files.join(", ")})`);
   return roles;
 }
+const isExecutor = (name) => name === "executor" || name.startsWith("executor-");
 function checkModels(roles) {
-  const exec = roles.executor?.model;
+  const execModels = Object.entries(roles).filter(([n]) => isExecutor(n)).map(([, r]) => r.model).filter(Boolean);
   for (const r of VERIFYING) {
-    if (roles[r] && exec && roles[r].model === exec)
-      die(`роль ${r} на той же модели, что исполнитель (${exec}) — проверяет всегда другая модель. Поправь factory.json`, 3);
+    const role = roles[r];
+    if (!role) continue;
+    if (role.crossReview) {
+      for (const [execProvider, rev] of Object.entries(role.crossReview))
+        if (rev.provider === execProvider)
+          die(`роль ${r}: crossReview для «${execProvider}» проверяет тем же провайдером — проверяет всегда другая модель. Поправь factory.json`, 3);
+    } else if (role.model && execModels.includes(role.model)) {
+      die(`роль ${r} на той же модели, что исполнитель (${role.model}) — проверяет всегда другая модель. Поправь factory.json`, 3);
+    }
   }
 }
 
@@ -97,15 +109,34 @@ const commands = {
   roles() {
     const roles = loadConfig();
     checkModels(roles);
-    for (const [name, r] of Object.entries(roles))
-      console.log(`${name.padEnd(9)} ${r.provider}  ${r.model}  усилие=${r.reasoning ?? "по умолчанию"}  окружение=${r.environment ?? "new-worktree"}`);
+    for (const [name, r] of Object.entries(roles)) {
+      if (r.crossReview) {
+        const pairs = Object.entries(r.crossReview).map(([p, rev]) => `${p}→${rev.provider} ${rev.model}`).join("; ");
+        console.log(`${name.padEnd(15)} перекрёстно: ${pairs}  усилие=${r.reasoning ?? "по умолчанию"}  окружение=${r.environment ?? "same"}`);
+      } else
+        console.log(`${name.padEnd(15)} ${r.provider}  ${r.model}  усилие=${r.reasoning ?? "по умолчанию"}  окружение=${r.environment ?? "new-worktree"}`);
+    }
   },
 
   spawn() {
     const role = rest[0] ?? die("factory spawn <role> --task <файл|-> [--env <id>]");
     const roles = loadConfig();
     checkModels(roles);
-    const r = roles[role] ?? die(`роль ${role} не описана в factory.json (есть: ${Object.keys(roles).join(", ")})`);
+    let r = roles[role] ?? die(`роль ${role} не описана в factory.json (есть: ${Object.keys(roles).join(", ")})`);
+    let reviewing = null;
+    if (r.crossReview) {
+      if (!opts.executor) die(`роль ${role} — перекрёстная проверка: --executor <thread-id исполнителя> обязателен (по нему выбирается модель проверяющего)`, 3);
+      const res = bb(["thread", "show", opts.executor, "--json"]);
+      if (res.status !== 0) die(`не читается тред исполнителя ${opts.executor}: ${(res.stderr || res.stdout).trim()}`);
+      const t = JSON.parse(res.stdout).thread ?? {};
+      const rev = r.crossReview[t.providerId];
+      if (!rev) die(`роль ${role}: нет crossReview для провайдера исполнителя «${t.providerId}» (есть: ${Object.keys(r.crossReview).join(", ")})`, 3);
+      if (opts.env && t.environmentId && opts.env !== t.environmentId) die(`--env ${opts.env} не совпадает с окружением исполнителя ${t.environmentId}`, 3);
+      opts.env = opts.env || t.environmentId;
+      const { crossReview, ...base } = r;
+      r = { ...base, ...rev };
+      reviewing = t.providerId;
+    }
     if (!r.provider || !r.model) die(`роль ${role}: нужны provider и model`);
     const rolePromptPath = join(kitDir, "roles", `${role}.md`);
     if (!existsSync(rolePromptPath)) die(`нет промпта роли: ${rolePromptPath}`);
@@ -129,6 +160,7 @@ const commands = {
       "",
       "## Как ты запущен",
       `Ты — роль «${role}» (${r.model}) в bb-треде${parent ? `, дочернем к оркестратору @thread:${parent}` : ""}.`,
+      ...(reviewing ? [`Работу делал исполнитель @thread:${opts.executor} на другом провайдере (${reviewing}) — перекрёстная проверка.`] : []),
       "Твой финальный ответ bb передаст оркестратору — это и есть твой отчёт: факты, команды и их фактический вывод, без «должно работать».",
       "Вопрос, без ответа на который нельзя продолжать, — задай его оркестратору финальным ответом и остановись.",
     ].join("\n");
@@ -151,7 +183,7 @@ const commands = {
     if (res.status !== 0) { process.stderr.write(res.stderr || res.stdout); process.exit(res.status || 1); }
     let thread;
     try { thread = JSON.parse(res.stdout); } catch { thread = { raw: res.stdout.trim() }; }
-    console.log(JSON.stringify({ role, model: r.model, thread: thread.id, environment: thread.environmentId ?? opts.env ?? null, title: thread.title }, null, 2));
+    console.log(JSON.stringify({ role, model: r.model, reviewing, thread: thread.id, environment: thread.environmentId ?? opts.env ?? null, title: thread.title }, null, 2));
   },
 
   env() {

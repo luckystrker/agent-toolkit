@@ -11,6 +11,7 @@
 //   --claude-hook        # PreToolUse-гейт Claude Code: с --project — в .claude/settings.json проекта,
 //                        # без — глобально в ~/.claude/settings.json (гейт на git commit в любом проекте)
 //   --instructions <файл># доп. файл инструкций (CLAUDE.md, QODER.md, ...) — можно несколько
+//   --no-tla             # (user) не скачивать TLC (tla2tools.jar) в ~/.agent-toolkit/tla/
 //   --dry-run            # показать план, ничего не менять
 //   --remove             # убрать установленное (по манифесту); флаги те же
 //   --version
@@ -25,7 +26,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
@@ -47,7 +48,7 @@ const dryRun = has("dry-run");
 const remove = has("remove");
 
 if (has("version")) { console.log(VERSION); process.exit(0); }
-if (has("help")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(2, 20).join("\n")); process.exit(0); }
+if (has("help")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(2, 21).join("\n")); process.exit(0); }
 for (const [name, minValues] of [["project", 1], ["skills-dir", 1], ["instructions", 1]]) {
   if (has(name) && values(name).filter((v) => v !== "").length < minValues) {
     console.error(`--${name} требует значение`);
@@ -548,11 +549,49 @@ function removeProjectMode() {
   manifest.projects = manifest.projects.filter((p) => p.dir !== projectDir);
 }
 
+// --- TLC (модель-чекер TLA+) ---
+// закреплённая версия + контрольная сумма: установщик не тянет «последнее» вслепую
+const TLA = {
+  version: "v1.7.4",
+  url: "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar",
+  sha256: "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88",
+};
+const tlaJar = join(metaRoot, "tla", "tla2tools.jar");
+const sha256 = async (buf) => (await import("node:crypto")).createHash("sha256").update(buf).digest("hex");
+
+async function installTla() {
+  if (has("no-tla")) { note("  = TLC пропущен (--no-tla)"); return; }
+  if (existsSync(tlaJar) && (await sha256(readFileSync(tlaJar))) === TLA.sha256) { note(`  = ${tlaJar} (TLC ${TLA.version} уже стоит)`); return; }
+  console.log(`TLC ${TLA.version} → ${tlaJar}`);
+  if (dryRun) { note(`  + ${tlaJar} (скачать ${TLA.url})`); return; }
+  try {
+    const res = await fetch(TLA.url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const got = await sha256(buf);
+    if (got !== TLA.sha256) throw new Error(`контрольная сумма не совпала: ${got}`);
+    act(`  + ${tlaJar}`, () => { mkdirSync(join(tlaJar, ".."), { recursive: true }); writeFileSync(tlaJar, buf); });
+    manifest.userTla = true;
+  } catch (e) {
+    console.error(`  TLC не установлен (${e.message}). Модели TLA+ в проектах будут блокировать коммит, пока его нет.\n` +
+      `  Повтори установку или положи tla2tools.jar ${TLA.version} в ${tlaJar} вручную.`);
+    process.exitCode = 1;
+  }
+  const java = spawnSync("java", ["-version"], { encoding: "utf8" }).status === 0 || existsSync(join(homedir(), "java"));
+  if (!java) console.error("  внимание: java не найдена (PATH, ~/java) — TLC без неё не запустится. Нужна Java 11+.");
+}
+function removeTla() {
+  if (!manifest.userTla || !existsSync(tlaJar)) return;
+  act(`  − ${tlaJar}`, () => rmSync(tlaJar, { force: true }));
+  delete manifest.userTla;
+}
+
 // --- запуск ---
 
 console.log(dryRun ? `agent-toolkit v${VERSION} — dry-run (ничего не меняется)\n` : `agent-toolkit v${VERSION}\n`);
 if (projectDir) { remove ? removeProjectMode() : installProjectMode(); }
-else { remove ? removeUserMode() : installUserMode(); }
+else if (remove) { removeUserMode(); removeTla(); }
+else { installUserMode(); if (skillsTargets.length > 0 || instrTargets.length > 0) await installTla(); }
 saveManifest();
 console.log(`\n${dryRun ? `План (${actions.length} действий) — запусти без --dry-run для применения.` : `Готово: ${actions.length} действий.`}` +
   (backupRoot ? `\nБэкапы изменённого: ${backupRoot}` : ""));
