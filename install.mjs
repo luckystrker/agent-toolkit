@@ -26,7 +26,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 const kitRoot = fileURLToPath(new URL(".", import.meta.url));
 const metaRoot = join(homedir(), ".agent-toolkit");
 const manifestPath = join(metaRoot, "manifest.json");
